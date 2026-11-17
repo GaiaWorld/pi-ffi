@@ -27,7 +27,11 @@
 
 进程间通信（IPC）、QUIC 以及发现、连接和访问设施均由宿主（host）与既有服务框架提供，本项目不实现这些设施。对不可信原生代码（native code）的安全隔离（security isolation）也由外部宿主（host）承担。
 
-动态服务（dynamic service）自动封装（automatic wrapping）及运行时（runtime）替换均属于本轮最小可行产品（MVP）目标。当前接入 `pi-async-rt`，设计必须承接后续 `pi-async-rt_v1.0` 的接口（API）和语义（semantics）差异。具体接入方式仍在设计中。服务接入尽量支持静态服务（static service），同时保留动态服务（dynamic service）的选择；不能仅凭产物是动态库（dynamic library）就改变原有服务形式。
+动态服务（dynamic service）自动封装（automatic wrapping）及运行时（runtime）替换均属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
+
+当前必要能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。普通跨库异步计算（Future）采用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）保留为运行时（runtime）内部合法上下文（context）中的用途，不作为本库当前必需显式输入约束，也不承诺跨库提交非 `Send` 工作；独立构建的上下文接线仍须核实。空闲提交接受不保证执行；等待、取消请求（cancellation request）及最终清理分别表达。
+
+每轮初始化固定运行时（runtime）能力，新轮或新版本可选择另一提供方（provider），在途异步计算（Future）在原后端（backend）完成或收尾，不迁移正在执行的工作。宿主（host）须保持必要推进及计时设施存续；插件（plugin）只能管理自身工作，不能关闭整个共享运行时（runtime）。这些能力范围已经对齐，具体封装接口（API）仍在设计中，当前骨架不提供上述运行行为。服务接入尽量支持静态服务（static service），同时保留动态服务（dynamic service）的选择；不能仅凭产物是动态库（dynamic library）就改变原有服务形式。
 
 ## 标准入口与初始化输入
 
