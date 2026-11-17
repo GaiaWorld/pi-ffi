@@ -48,6 +48,16 @@
 
 释放系统加载句柄（loader handle）不保证所有平台立即完成物理卸载（physical unloading）或重置静态状态（static state）。参见 [Windows `FreeLibrary`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary) 与 [POSIX `dlclose`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlclose.html)。若反复使用确实遇到当前无法可靠解决的保留状态问题，将依据真实证据讨论限制；目前没有采用“同版本仅能使用一次”的普遍限制。
 
+### 共享持有（shared holding）与释放责任
+
+以下是已经对齐的使用约定，具体 Rust 接口（API）仍待完整设计冻结。真实对象留在来源侧；初始化的三项输入通过受控 C 表取得同一宿主管理接口（host management interface），不增加第四个初始化入参。普通使用者通过 Rust 封装访问，不直接还原另一构建中的 `Config`、`Arc` 或错误报告（error report）。
+
+本地克隆（Clone）共享一个拥有者；需要另一份独立持有（independent holding）时，必须显式取得。每份独立持有在对外交付前，宿主（host）就已登记剩余释放义务及所需代码保活。最后一个本地拥有者结束时，只提交这条已有记录；提交不临时分配记录，也不执行来源回调（source callback）。宿主（host）随后推进真实释放，最终失败保留在管理状态与关闭结果中。
+
+例如，最后一个本地拥有者销毁时，另一个线程仍在执行一次已经获准的调用：释放提交可以成功，但关闭仍须返回忙碌（Busy），直到该调用退出、真实清理完成。**提交成功、持有归还和清理完成分别判断。** 不能只依据 `Drop` 已执行就释放动态库（dynamic library）的代码映射（code mapping）。
+
+后续正式接入示例将给出管理推进及最终关闭的实际调用；当前尚无可直接运行的本库接口（API）示例。安全 Rust 也允许通过 `mem::forget` 跳过析构（Drop），因此遗忘拥有者可能延后卸载（unloading），不能强制清零来绕过它。依据为 [Rust 关于遗忘与安全的说明](https://doc.rust-lang.org/1.100.0/std/mem/fn.forget.html#safety)。
+
 ## 恐慌（panic）策略与构建设置
 
 **Cargo 内建的开发配置（development profile）和发布配置（release profile）默认都是 `panic = "unwind"`。** 对上述两个目标平台，如果没有其它有效设置覆盖，不显式写这一项也使用栈展开（stack unwinding）。这不是对所有 Rust 目标平台的保证；不支持栈展开（stack unwinding）的目标存在例外。依据为 [Cargo 配置（profile）及默认值说明](https://doc.rust-lang.org/1.100.0/cargo/reference/profiles.html#panic)，核验基于 Rust 1.100.0 官方文档。
