@@ -1,6 +1,6 @@
 # pi-ffi
 
-`pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、管理和卸载符合约定的 Rust 插件动态库（plugin dynamic library），并支持服务接入与运行时（runtime）替换。
+`pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、初始化、维护、关闭和卸载符合约定的 Rust 插件动态库（plugin dynamic library），并安全交接初始化输入，支持运行时（runtime）替换。插件提供的业务服务（business service）对本库完全透明。
 
 **当前处于设计阶段，尚无可用的完整接入接口（API）。** 下文区分已经对齐的使用约定和仍需设计的具体表示；已有 Rust、Cargo 与 `pi_result` 接口（API）的示例可以单独验证，不能据此推断本项目已经实现或通过验收。
 
@@ -11,7 +11,7 @@
 | [pi_ffi_abi](crates/pi_ffi_abi/src/lib.rs) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
 | [pi_ffi_core](crates/pi_ffi_core/src/lib.rs) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
 
-`pi_ffi_core` 当前包含 65 处 `todo!` 未实现桩（unimplemented stub）。构建与公开文档生成已通过，业务行为尚未实现；调用这些桩会触发恐慌（panic），不能将当前骨架用于实际插件接入。运行时（runtime）、配置（Config）、服务适配和完整加载管理库将在后续设计批次中补齐。
+`pi_ffi_core` 当前包含 65 处 `todo!` 未实现桩（unimplemented stub）。构建与公开文档生成已通过，运行行为尚未实现；调用这些桩会触发恐慌（panic），不能将当前骨架用于实际插件接入。运行时（runtime）、配置（Config）、P2P 服务终端（P2P service terminal）的输入封装和完整加载管理库将在后续设计批次中补齐。
 
 ## 支持范围与职责
 
@@ -22,24 +22,26 @@
 | 参与方 | 负责内容 |
 | --- | --- |
 | 宿主（host） | 选择可信且遵守约定的外部产物，提供运行时（runtime）、终端相关实例及初始化配置（initialization configuration）；通过既有服务框架提供发现、访问和跨进程通信（inter-process communication） |
-| 本库 | 在合法外部函数接口（FFI）调用范围内管理加载、版本接纳、并发调用（concurrent invocation）、生命周期（lifecycle）及受控能力的交接与释放 |
-| 插件动态库（plugin dynamic library）的实现方 | 提供标准入口，管理自身任务（task）、服务和资源；遵守初始化、幂等性（idempotency）、错误、恐慌（panic）及清理约定；声明并正确处理自己使用的共享资源 |
+| 本库 | 管理动态库（dynamic library）的加载、版本接纳、同步管理调用（management call）、生命周期（lifecycle）及初始化输入的安全交接与释放 |
+| 插件动态库（plugin dynamic library）的实现方 | 提供标准管理入口，使用注入能力自行管理任务（task）、业务服务（business service）和资源；通过既有服务框架完成业务接口（business API）的声明、封装、汇总、注册、加载、调用和退出；遵守初始化、幂等性（idempotency）、错误、恐慌（panic）及清理约定 |
 
 进程间通信（IPC）、QUIC 以及发现、连接和访问设施均由宿主（host）与既有服务框架提供，本项目不实现这些设施。对不可信原生代码（native code）的安全隔离（security isolation）也由外部宿主（host）承担。
 
-动态服务（dynamic service）自动封装（automatic wrapping）及运行时（runtime）替换均属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
+业务服务（business service）采用静态服务（static service）或动态服务（dynamic service），由插件实现方与既有服务框架选择和实现，本库不读取业务接口（business API）或服务集合。服务运行受传入的 P2P 服务终端（P2P service terminal）及既有框架约束；动态库（dynamic library）加载或初始化时可能触发插件内部静态声明的汇总和注册。这些动作在插件／框架内完成，不要求本库或宿主应用为每项服务接线。
+
+运行时（runtime）替换属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
 
 当前必要能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。普通跨库异步计算（Future）采用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）保留为运行时（runtime）内部合法上下文（context）中的用途，不作为本库当前必需显式输入约束，也不承诺跨库提交非 `Send` 工作；独立构建的上下文接线仍须核实。空闲提交接受不保证执行；等待、取消请求（cancellation request）及最终清理分别表达。
 
-每轮初始化固定运行时（runtime）能力，新轮或新版本可选择另一提供方（provider），在途异步计算（Future）在原后端（backend）完成或收尾，不迁移正在执行的工作。宿主（host）须保持必要推进及计时设施存续；插件（plugin）只能管理自身工作，不能关闭整个共享运行时（runtime）。这些能力范围已经对齐，具体封装接口（API）仍在设计中，当前骨架不提供上述运行行为。服务接入尽量支持静态服务（static service），同时保留动态服务（dynamic service）的选择；不能仅凭产物是动态库（dynamic library）就改变原有服务形式。
+每轮初始化固定运行时（runtime）能力，新轮或新版本可选择另一提供方（provider），在途异步计算（Future）在原后端（backend）完成或收尾，不迁移正在执行的工作。宿主（host）须保持必要推进及计时设施存续；插件（plugin）只能管理自身工作，不能关闭整个共享运行时（runtime）。这些能力范围已经对齐，具体封装接口（API）仍在设计中，当前骨架不提供上述运行行为。
 
 运行时（runtime）的提供与使用是基础职责边界：宿主（host）提供满足合同的实例，插件动态库（plugin dynamic library）的 Rust 代码完全负责如何使用和维护，包括创建异步计算（Future）、普通／空闲提交、计时／等待、结果／错误处理、取消及自身关闭前收尾。宿主应用无需枚举或逐项管理这些任务（task）；注入运行时（runtime）按自身正常机制执行它们。
 
-接入必须具有透明性（transparency）：本库向双方提供安全的 Rust 封装，内部自动处理受控 C 表示的装拆包、访问校验、跨库轮询（poll）／唤醒（wake）转换及必要存续保护，普通使用方无需手工维护这些 FFI 机制。当前已选方式将真实异步计算（Future）及数据留在插件来源内，由注入运行时（runtime）经本库内部受控同步 C 操作推进；业务导出保持同步 C 接口（C API），初始化仍为三项输入。插件负责自身工作的收尾，本库持续守护实际代码引用与清理责任；未完成时按约定返回 Busy 或失败。具体接口（API）尚未冻结，上述边界尚无产品行为验证结果。
+接入必须具有透明性（transparency）：本库向双方提供安全的 Rust 封装，内部自动处理受控 C 表示的装拆包、访问校验、跨库轮询（poll）／唤醒（wake）转换及必要存续保护，普通使用方无需手工维护这些 FFI 机制。当前已选方式将真实异步计算（Future）及数据留在插件来源内，由注入运行时（runtime）经本库内部受控同步 C 操作推进；标准管理导出保持同步 C 接口（C API），初始化仍为三项输入。运行时查询（RuntimeQuery）及内部受控操作不构成插件的业务查询接口（business query API）。插件负责自身工作的收尾，本库持续守护实际代码引用与清理责任；未完成时按约定返回 Busy 或失败。具体接口（API）尚未冻结，上述边界尚无产品行为验证结果。
 
 ## 标准入口与初始化输入
 
-标准至少包含以下三类入口。具体名称、类型（type）、布局（layout）、所有权（ownership）交接及完整返回格式尚未冻结。
+当前标准对外提供以下三类同步管理入口。具体名称、类型（type）、布局（layout）、所有权（ownership）交接及完整返回格式尚未冻结。业务服务（business service）通过既有服务框架提供，不属于这些管理入口。
 
 | 入口 | 已对齐的使用约定 |
 | --- | --- |
@@ -251,12 +253,12 @@ fn main() -> pi_result::Result<()> {
 
 在该独立项目中运行 `cargo run`。默认恐慌钩子（panic hook）可能仍向标准错误（stderr）打印恐慌（panic）消息；它不表示捕获失败。示例应继续打印两份详细错误报告（error report）并正常退出。这个示例仅证明所示普通错误与受控同步恐慌（synchronous panic）的处理；它不验证异步退出（asynchronous shutdown）、任意载荷（payload）、跨库表示或卸载（unloading）安全。
 
-## 服务接入与清理注意事项
+## 插件实现方的服务接入与清理注意事项
 
-远程过程调用（RPC）必须异步（asynchronous）。标准导出层无需提供通用 Rust 异步计算（Future）或轮询（poll）／唤醒（wake-up）协议；异步逻辑（asynchronous logic）由内部 Rust 实现，使用初始化注入的运行时（runtime）及宿主（host）服务框架推进。内部运行时（runtime）封装仍须定义提交、完成和释放约定，不能由此省略跨库安全设计。
+插件通过既有服务框架提供异步远程过程调用（asynchronous RPC），其接口（API）和行为由插件及框架维护，对本库完全透明。标准管理导出层无需提供通用 Rust 异步计算（Future）或轮询（poll）／唤醒（wake-up）协议；内部运行时（runtime）封装仍须定义必要安全合同，不增加业务查询、任务进度或服务控制入口。
 
-清理必须让已经提交的任务（task）、服务调用（service invocation）及相关资源真正退出；不得在推进这些工作的唯一执行线程（executor thread）上阻塞等待其完成。静态登记（static registration）可以被发现，不代表其调用、关闭及最终卸载（unloading）已经安全。
+插件实现方负责让自身任务（task）、服务调用（service invocation）及相关资源真正退出；不得在推进这些工作的唯一执行线程（executor thread）上阻塞等待其完成。本库调用标准关闭并依据结果及受控代码持有推进最终卸载（unloading），不枚举或关闭业务服务（business service）。静态登记（static registration）可以被发现，不代表最终卸载（unloading）已经安全。
 
 后续可将 `pi_db_server` 等既有库包装为合规外部产物，并作为真实集成示例（integration example）。包装方应尽量保持原有接口（API），同时完整保持全部服务接口（service API）、语义（semantics）和逻辑（logic）；当前尚未验证其完整初始化与退出路径。
 
-随着正式接口（API）冻结和实现，将继续补齐宿主（host）接入、外部产物导出、配置（configuration）传递、两类服务接入、失败清理及反复使用的可运行示例。这里的说明和示例不替代尚未完成的设计冻结或产品验收。
+随着正式接口（API）冻结和实现，将继续补齐宿主（host）管理接入、外部产物管理导出、初始化输入传递、失败清理及反复使用的可运行示例。静态／动态服务（static/dynamic service）示例仅演示下游插件使用既有框架的兼容性；本库不实现业务服务（business service）管理。这里的说明和示例不替代尚未完成的设计冻结或产品验收。
