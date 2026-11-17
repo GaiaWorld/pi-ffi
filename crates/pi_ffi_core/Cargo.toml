@@ -1,0 +1,9 @@
+[package]
+name = "pi_ffi_core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pi_ffi_abi.workspace = true
+pi_result.workspace = true
+parking_lot.workspace = true

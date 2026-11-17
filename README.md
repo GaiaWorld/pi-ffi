@@ -4,6 +4,15 @@
 
 **当前处于设计阶段，尚无可用的完整接入接口（API）。** 下文区分已经对齐的使用约定和仍需设计的具体表示；已有 Rust、Cargo 与 `pi_result` 接口（API）的示例可以单独验证，不能据此推断本项目已经实现或通过验收。
 
+共同外部函数接口（FFI）及 Rust 壳（shell）已经冻结，并生成两个基础库（foundation crate）：
+
+| 库（crate） | 当前职责 |
+| --- | --- |
+| [pi_ffi_abi](crates/pi_ffi_abi/src/lib.rs) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
+| [pi_ffi_core](crates/pi_ffi_core/src/lib.rs) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
+
+`pi_ffi_core` 当前包含 65 处 `todo!` 未实现桩（unimplemented stub）。构建与公开文档生成已通过，业务行为尚未实现；调用这些桩会触发恐慌（panic），不能将当前骨架用于实际插件接入。运行时（runtime）、配置（Config）、服务适配和完整加载管理库将在后续设计批次中补齐。
+
 ## 支持范围与职责
 
 首批正式支持与原生验证（native validation）的设计目标为 Windows x86_64／MSVC 和 Linux x86_64／GNU。这里声明的是目标范围，尚未完成这两个平台的产品验证。
@@ -50,13 +59,23 @@
 
 ### 共享持有（shared holding）与释放责任
 
-以下是已经对齐的使用约定，具体 Rust 接口（API）仍待完整设计冻结。真实对象留在来源侧；初始化的三项输入通过受控 C 表取得同一宿主管理接口（host management interface），不增加第四个初始化入参。普通使用者通过 Rust 封装访问，不直接还原另一构建中的 `Config`、`Arc` 或错误报告（error report）。
+以下共同合同及基础 Rust 接口（API）已经冻结；具体运行时（runtime）、配置（Config）和服务能力仍待各自设计。真实对象留在来源侧；初始化的三项输入通过受控 C 表取得同一宿主管理接口（host management interface），不增加第四个初始化入参。普通使用者通过 Rust 封装访问，不直接还原另一构建中的 `Config`、`Arc` 或错误报告（error report）。
 
 本地克隆（Clone）共享一个拥有者；需要另一份独立持有（independent holding）时，必须显式取得。每份独立持有在对外交付前，宿主（host）就已登记剩余释放义务及所需代码保活。最后一个本地拥有者结束时，只提交这条已有记录；提交不临时分配记录，也不执行来源回调（source callback）。宿主（host）随后推进真实释放，最终失败保留在管理状态与关闭结果中。
 
 例如，最后一个本地拥有者销毁时，另一个线程仍在执行一次已经获准的调用：释放提交可以成功，但关闭仍须返回忙碌（Busy），直到该调用退出、真实清理完成。**提交成功、持有归还和清理完成分别判断。** 不能只依据 `Drop` 已执行就释放动态库（dynamic library）的代码映射（code mapping）。
 
 后续正式接入示例将给出管理推进及最终关闭的实际调用；当前尚无可直接运行的本库接口（API）示例。安全 Rust 也允许通过 `mem::forget` 跳过析构（Drop），因此遗忘拥有者可能延后卸载（unloading），不能强制清零来绕过它。依据为 [Rust 关于遗忘与安全的说明](https://doc.rust-lang.org/1.100.0/std/mem/fn.forget.html#safety)。
+
+析构（Drop）的提交路径只返回有限的 `pi_result` 分类投影，不创建新的错误报告（Report）。显式 `Object::release` 在最后一个本地拥有者需要提交时，再于允许分配的返回路径形成 `pi_result`；有其它本地别名时仅结束当前别名。最终清理是否完成，仍由宿主管理状态与关闭结果说明。
+
+### 首次取得管理接口时的错误
+
+首次查询失败时，接收方可能还没有建立管理连接（management connection）。标准来源必须在自身登记表内创建该次查询／`retain` 的错误诊断（diagnostic）；转发其它来源的错误时，先在本地转换为 `pi_result`，再生成自己的诊断。
+
+接入封装在原调用已经提供的代码与上下文（context）保护内，复制同一来源的诊断，再显式归还；这条归还路径不放入析构（Drop）。来源已经拥有自己的宿主连接，由它先提交该诊断预登记的释放记录，再确认归还。重复提交已有记录不增加任务，也不即时执行来源回调（source callback）。
+
+来源、上下文（context）或轮次不匹配的返回值按损坏（Corrupted）拒绝读取，不尝试解引用未经保护的地址。已有释放责任及代码持有保留，不能把拒绝读取当作已经完成清理。标准来源的代码保护、逐次访问核验与独立持有须同时满足；只检查指针非空并不充分。
 
 ## 恐慌（panic）策略与构建设置
 
@@ -143,7 +162,11 @@ Rust 库（Rust library）的链接（linking）兼容要求参见 [Rust 链接�
 
 ## `pi_result` 错误处理示例
 
-本库全部错误定义和处理使用 `pi_result`。跨外部函数接口（FFI）时采用宿主自有诊断数据副本（host-owned diagnostic copy）的方向：来源方提取约定的详细信息，宿主（host）复制并构造自己拥有的错误报告（error report），原报告（report）与原内存由创建方释放。完整字段（field）、编码（encoding）及释放接口（release API）仍待冻结。
+本库全部错误定义和处理使用 `pi_result`。跨外部函数接口（FFI）时采用已经冻结的宿主自有诊断数据副本（host-owned diagnostic copy）合同：来源方提取公共分类及 `user`／`verbose`／`debug` 三段 UTF-8 文本，宿主（host）复制并构造自己拥有的错误报告（error report），原报告（report）与原内存由创建方释放。来源内部可以暂存 `Pin<Box<pi_result::Error>>`，接收方不把该指针还原为本地原生错误。
+
+共同结果 `OutcomeV1` 只允许三种表示：成功时两个分类为零且诊断为空；操作失败时携带一个独立诊断；诊断本身无法建立时携带操作分类及诊断建立失败分类，诊断为空。未知非零分类映射为 `Other` 并保留原编号；矛盾表示按 `Corrupted` 处理。固定编号是成功 `0` 及以下依次对应 `1`—`17` 的分类：`InvalidInput`、`InvalidState`、`NotFound`、`AlreadyExists`、`Conflict`、`PermissionDenied`、`Io`、`Timeout`、`Cancelled`、`Busy`、`Unavailable`、`Unsupported`、`ResourceExhausted`、`Corrupted`、`Dependency`、`Internal`、`Other`。
+
+文本长度按 UTF-8 字节计数，不含结尾零字节；复制前检查总长度、整数转换和容量，成功写入量必须精确一致。读取或复制失败也必须交接已经接管的诊断释放责任，次级失败不能覆盖原操作分类。原始三段文本作为本地 `CopiedDiagnostic` 保留；本地报告格式会增加自己的上下文（context），不能用重新格式化代替原始文本。诊断无法建立时，不声称恢复未取得的文本或原生附件（native attachment）。
 
 原生 `ErrorReport`、`String`、`Vec`、`Arc` 或特征对象（trait object）不能直接当作稳定 C 表示返回；`ErrorKind` 的声明顺序也不能当作协议数字编码（protocol numeric encoding）。诊断复制不等于恢复原始 Rust 错误类型（error type）或任意不透明附件（opaque attachment）。
 

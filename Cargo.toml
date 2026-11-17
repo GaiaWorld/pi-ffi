@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/pi_ffi_abi", "crates/pi_ffi_core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+pi_ffi_abi = { version = "0.1", path = "crates/pi_ffi_abi" }
+pi_result = { version = "0.2", path = "../pi_result" }
+parking_lot = "0.13"
