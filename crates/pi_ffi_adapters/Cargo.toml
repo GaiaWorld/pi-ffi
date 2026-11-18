@@ -1,0 +1,13 @@
+[package]
+name = "pi_ffi_adapters"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+pi_ffi_abi.workspace = true
+pi_ffi_core = { version = "0.1", path = "../pi_ffi_core" }
+pi_result.workspace = true
+pi_async_runtime_core = { package = "pi-async-runtime-core", version = "0.1", path = "../../../pi-async-rt_v1.0/crates/runtime-core" }
