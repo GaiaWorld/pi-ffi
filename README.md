@@ -21,7 +21,7 @@
 
 | 参与方 | 负责内容 |
 | --- | --- |
-| 宿主（host） | 选择可信且遵守约定的外部产物，提供运行时（runtime）、终端相关实例及初始化配置（initialization configuration）；通过既有服务框架提供发现、访问和跨进程通信（inter-process communication） |
+| 宿主（host） | 选择可信且遵守约定的外部产物，提供必传的 `pi-p2p-service` 终端实例（terminal instance）及 `pi_config::Config`，可选提供运行时（runtime）。通过既有服务框架提供发现、访问和跨进程通信（inter-process communication） |
 | 本库 | 管理动态库（dynamic library）的加载、版本接纳、同步管理调用（management call）、生命周期（lifecycle）及初始化输入的安全交接与释放 |
 | 插件动态库（plugin dynamic library）的实现方 | 提供标准管理入口，使用注入能力自行管理任务（task）、业务服务（business service）和资源；通过既有服务框架完成业务接口（business API）的声明、封装、汇总、注册、加载、调用和退出；遵守初始化、幂等性（idempotency）、错误、恐慌（panic）及清理约定 |
 
@@ -31,11 +31,11 @@
 
 运行时（runtime）替换属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
 
-当前必要能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。普通跨库异步计算（Future）采用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）保留为运行时（runtime）内部合法上下文（context）中的用途，不作为本库当前必需显式输入约束，也不承诺跨库提交非 `Send` 工作；独立构建的上下文接线仍须核实。空闲提交接受不保证执行；等待、取消请求（cancellation request）及最终清理分别表达。
+提供运行时（runtime）时，所需能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。普通跨库异步计算（Future）采用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）保留为运行时（runtime）内部合法上下文（context）中的用途，不作为本库当前必需显式输入约束，也不承诺跨库提交非 `Send` 工作；独立构建的上下文接线仍须核实。空闲提交接受不保证执行；等待、取消请求（cancellation request）及最终清理分别表达。
 
-每轮初始化固定运行时（runtime）能力。新轮或新版本可以传入另一实例，在途异步计算（Future）仍在原实例完成或收尾。外部运行时（runtime）的实际拥有方负责创建、推进、保持可用和关闭实例。宿主应用（host application）把可用实例交给 `pi-ffi`。
+每轮初始化固定运行时（runtime）的有无及所提供的实例。新轮或新版本可以提供另一实例，也可以省略该输入。在途异步计算（Future）仍在原实例完成或收尾。外部运行时（runtime）的实际拥有方负责创建、推进、保持可用和关闭实例。
 
-本库经安全 Rust 封装把外部运行时（runtime）的使用能力透传给插件，负责跨库表示、访问校验以及调用和引用的有效期。插件动态库（plugin dynamic library）自行使用该能力并在关闭时收尾自身工作。本库默认不维护任何运行时（runtime）实例。
+本库经安全 Rust 封装透传外部运行时（runtime）的有无。提供实例时，本库交接其使用能力，负责跨库表示、访问校验以及调用和引用的有效期。插件动态库（plugin dynamic library）自行决定用法并在关闭时收尾自己的工作。
 
 本库依据插件的标准关闭结果及相关跨库引用判断是否可卸载（unloadable）。共享运行时（runtime）可继续为其他使用者工作。若仍有在途调用（in-flight call）或引用依赖插件代码，本库保留相应映射并按约定返回 Busy 或失败。运行时查询（RuntimeQuery）供插件显式调用。具体封装接口（API）仍在设计中。
 
@@ -46,7 +46,7 @@
 | 入口 | 已对齐的使用约定 |
 | --- | --- |
 | 只读元信息（read-only metadata）查询 | 提供稳定身份声明及完整语义化版本号（semantic version）；在合法加载期间的初始化前、中、后及关闭期间、关闭后都可查询，不以业务初始化为前提 |
-| 初始化 | 接收运行时（runtime）的外部函数接口（FFI）封装、终端相关实例及 `pi_config::Config`；明确返回成功或失败，并交付本次初始化的标识（initialization identifier），包括需要继续清理的失败方向 |
+| 初始化 | 接收必传的 `pi-p2p-service` 终端实例（terminal instance）、`pi_config::Config` 及可选的外部运行时（runtime）。明确返回成功或失败，并交付本次初始化的标识（initialization identifier），包括需要继续清理的失败情况 |
 | 关闭、清理与释放 | 接收本次初始化的标识（initialization identifier），明确返回成功或失败；旧标识（identifier）的延迟调用不能关闭新一轮使用 |
 
 外部函数接口（FFI）采用目标平台的 C 应用二进制接口（C ABI）和受控表示。上述 `pi_config::Config` 是已经确定的输入对象；其跨库表示仍需设计，不能直接把任意 Rust 对象地址当作可互操作的参数。`repr(C)` 本身也不会使其内部嵌套的任意 Rust 类型（type）具备稳定表示。参见 [Rust 类型布局（type layout）说明](https://doc.rust-lang.org/reference/type-layout.html#representations)。
@@ -61,7 +61,7 @@
 - 同一进程（process）内重复加载同一实际模块（loaded module）时，共享其本轮实际初始化；输入冲突不能靠再次初始化解决。标准入口自身必须具有语义幂等性（semantic idempotency）。
 - 关闭失败时保留必要的代码映射（code mapping）和同版本占用，仅在安全前提满足时继续尚未完成的清理。超时不等于后台工作已经停止。
 - 再次初始化必须等本轮清理成功，且旧业务工作与调用资格已经退出或失效。最终卸载（unloading）还须等待所有需要代码映射（code mapping）的引用退出；只读查询及其返回数据也受此约束。
-- 关闭插件时按约定归还本轮初始化输入的跨库持有。共享运行时（runtime）由其外部拥有方继续管理。
+- 关闭插件时按约定归还本轮对实际输入取得的跨库持有。共享运行时（runtime）由其外部拥有方继续管理。
 
 不同版本使用不同文件，并不能消除共享依赖（shared dependency）、符号（symbol）、配置（configuration）、文件、端口等资源冲突。本库对受控能力提供守护；实现方仍须正确获取、使用和释放其私有逻辑涉及的资源。具体逐项检查与守护边界仍需冻结。
 
@@ -69,7 +69,7 @@
 
 ### 共享持有（shared holding）与释放责任
 
-以下共同合同及基础 Rust 接口（API）已经冻结；具体运行时（runtime）、配置（Config）和服务能力仍待各自设计。真实对象留在来源侧；初始化的三项输入通过受控 C 表取得同一宿主管理接口（host management interface），不增加第四个初始化入参。普通使用者通过 Rust 封装访问，不直接还原另一构建中的 `Config`、`Arc` 或错误报告（error report）。
+共同对象合同及基础 Rust 接口（API）已经冻结。运行时（runtime）、配置（Config）和服务的具体能力仍在设计中。真实对象留在来源侧，已提供的初始化输入通过受控 C 表关联同一宿主管理接口（host management interface）及同一初始化轮次。普通使用者通过 Rust 封装访问这些能力。
 
 本地克隆（Clone）共享一个拥有者；需要另一份独立持有（independent holding）时，必须显式取得。每份独立持有在对外交付前，宿主（host）就已登记剩余释放义务及所需代码保活。最后一个本地拥有者结束时，只提交这条已有记录；提交不临时分配记录，也不执行来源回调（source callback）。宿主（host）随后推进真实释放，最终失败保留在管理状态与关闭结果中。
 
