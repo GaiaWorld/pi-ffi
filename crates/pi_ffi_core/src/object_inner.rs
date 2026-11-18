@@ -12,6 +12,20 @@ pub(super) fn object_initialization(receiver: &Object) -> InitIdV1 {
     todo!("输入（input）：self；本地步骤（local steps）：逐字段重建本对象所属初始化标识；不取得新持有，不查询已退役来源；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
 }
 
+pub(super) fn object_with_borrowed<R>(
+    receiver: &Object,
+    body: impl for<'call> FnOnce(&'call ObjectRefV1) -> Result<R>,
+) -> Result<R> {
+    todo!("取得现有持有的读取调用保活，在闭包范围内借用C表示，归还调用并保留主错误及归还失败")
+}
+
+pub(super) unsafe fn object_retain_borrowed(
+    connection: &Connection,
+    input: &ObjectRefV1,
+) -> Result<Object> {
+    todo!("复核同轮与实际管理连接，在调用保护内取得并唯一接管独立持有，保留诊断和释放责任")
+}
+
 pub(super) fn object_try_retain(receiver: &Object) -> Result<Object> {
     todo!("输入（input）：self；本地步骤（local steps）：保留当前拥有者并取得调用资格；新操作retain后立刻接管返回的独立持有，再做失败加工；当前对象不因失败失效；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
 }

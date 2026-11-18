@@ -142,6 +142,53 @@ impl Object {
     pub fn initialization(&self) -> InitIdV1 {
         inner::object_initialization(self)
     }
+    /// 在一次同步闭包（closure）调用内借用当前持有的C表示。
+    ///
+    /// 借用在闭包返回或栈展开（stack unwinding）时结束。复制字段不延长借用期。
+    /// 读取调用保护只保证来源代码和上下文存续。标准初始化准入由调用方另行取得。
+    /// 闭包需满足被调用入口的安全前提，包括该入口的代码存续。
+    /// 闭包应在相应代码保护内接管C调用返回的独立持有及诊断。返回值及错误应由
+    /// 本侧独立拥有，退出借用后仍可安全销毁。保活归还失败可能发生在闭包已执行后。
+    /// 保活获取失败时不调用闭包。闭包错误和保活归还失败均用pi_result返回。
+    /// 闭包的Rust恐慌（panic）按Rust规则传播。
+    // 本地步骤（local steps）：借用self保留拥有者。锁内核Live后解锁。为现有对象
+    // 取得新操作号和读取调用保活，再将原raw的短期引用交闭包一次。调用方在闭包和
+    // 被调用代码的保护内先接管管理C结果及诊断，并保留已发生的操作进度，再退出闭包。
+    // 闭包正常返回后显式finish。闭包错误优先，附加finish错误。仅finish失败时丢弃闭包结果并报错，
+    // 已发生的闭包副作用不回滚。栈展开由Call的Drop提交归还。外部调用和析构都在锁外。
+    // @trace 25
+    pub fn with_borrowed<R>(
+        &self,
+        body: impl for<'call> FnOnce(&'call ObjectRefV1) -> Result<R>,
+    ) -> Result<R> {
+        inner::object_with_borrowed(self, body)
+    }
+
+    /// 从初始化调用中的借用输入取得一份独立持有（independent holding）。
+    ///
+    /// 新持有由返回对象释放。输入持有仍由原拥有者负责。
+    /// 每次独立调用请求一份新持有。后续能力访问仍须逐次核实。
+    ///
+    /// # Safety
+    /// input是当前受保护的同步初始化输入。外层保护在本调用完成前持续覆盖原持有、
+    /// 来源代码、上下文和诊断表。所有来源表均为合法且遵约的C表。connection须是
+    /// 当前初始化引导已建立的连接。仅持有复制字段无法满足这些前提。
+    // 本地步骤（local steps）：从标识核对同轮，用Connection::check_peer核实际
+    // 管理上下文及表。以完整原持有取得读取调用保活，随后核固定SourceApiV1表头
+    // 及retain入口。按新操作号调用来源retain，由来源再次核准入，锁外调用C表。
+    // 输出位先逐字段初始化为零和空地址。保护内核OutcomeV1完整表示。只有合法的
+    // 独立诊断分支需要比对诊断来源号、上下文及轮次。三种合法结果均走diagnostic::decode。
+    // 有限失败保留操作和诊断建立两项分类。独立诊断由decode再取登记的诊断调用保护。
+    // 仅合法成功读取输出。核同来源、上下文、表、槽位及代际、轮次、非零且不同的持有号。
+    // 通过Object::from_transfer立即唯一接管合法新持有，包装失败沿其既有恢复约定收尾。
+    // 矛盾结果报Corrupted，保留来源既有可追踪责任，不为未经证明的地址调用释放。
+    // 显式finish，操作失败保留主错误并追加归还错误，仅finish失败时按新拥有者Drop
+    // 归还新持有后报错。结果不确定时不得另取操作号重放。全程不消费输入。
+    // @trace 26
+    pub unsafe fn retain_borrowed(connection: &Connection, input: &ObjectRefV1) -> Result<Self> {
+        unsafe { inner::object_retain_borrowed(connection, input) }
+    }
+
     /// 新建独立来源持有；操作失败不改变当前拥有者。
     // 本地步骤（local steps）：保留当前拥有者并取得调用资格；新操作retain后立刻接管返回的独立持有，再做失败加工；当前对象不因失败失效。
     // @trace 11
