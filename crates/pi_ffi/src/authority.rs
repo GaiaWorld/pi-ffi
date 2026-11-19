@@ -125,7 +125,10 @@ struct RegisteredSource {
     id: InitIdV1,
     source: u64,
     descriptor: SourceDescriptorV1,
-    operation: OperationIdV1,
+    registration_operation: OperationIdV1,
+    retirement: Option<SourceRetirement>,
+    maintenance_pending: bool,
+    maintenance_operation: Option<OperationIdV1>,
     state: SourceState,
     failure: Option<Arc<Error>>,
 }
@@ -134,9 +137,24 @@ struct RegisteredSource {
 // 及本次访问资格保护，各项操作按 B1 的线程安全合同调用，无裸指针交给使用方。
 unsafe impl Send for RegisteredSource {}
 
+// 先登记的来源退役（source retirement）占用唯一实际操作。
+// request 是来源经宿主入口提交的原标识；control 用于推进真实来源检查。
+struct SourceRetirement {
+    request: Option<OperationIdV1>,
+    control: OperationIdV1,
+}
+
 enum SourceState {
     Registered,
     Retiring,
+    CheckingRetirement {
+        thread: std::thread::ThreadId,
+        diagnostic: Option<HoldingKey>,
+    },
+    RetirementFailed {
+        kind: u32,
+        diagnostic_failure_kind: u32,
+    },
     ReleasingContext,
     Retired,
     Quarantined,
@@ -150,6 +168,8 @@ struct HoldingKey {
 
 struct HoldingRecord {
     target: HoldingKey,
+    // 与本条记录一并预留；重放不重新分配。来源对象归还复用此操作编号。
+    release_operation: OperationIdV1,
     phase: HoldingPhase,
     failure: Option<Arc<Error>>,
 }
@@ -164,7 +184,13 @@ enum HoldingPhase {
 
 enum CallIdentifier {
     Standard(u64),
-    Source(CallTokenV1),
+    // 同请求的回执不是新使用资格。每个独立调用取得自己的操作编号。
+    Source {
+        token: CallTokenV1,
+        operation: OperationIdV1,
+        rights: u64,
+        active: bool,
+    },
 }
 
 struct CallRecord {
@@ -245,6 +271,27 @@ pub(crate) enum RoundAdmission {
 唯一短锁保护版本占用、轮次、已登记调用和归还记录。系统装卸、插件和来源
 调用、诊断格式化及可能是最后一份所有权的析构，在锁外。活动调用令牌、不重复
 的操作编号和来源身份在同一处登记。来源控制函数返回后才移除其保护。
+
+独立持有完成登记时原子预留归还操作，宿主操作的 actor 为零。对象归还用本编号；
+诊断 C 归还无编号，同一记录只授予一次宿主派发资格。首次引导可先在原保护里
+显式归还，宿主再按既有记录重放；来源只改变一次实际状态。退役前继续保存来源、
+表和上下文的合法核对依据。活动来源调用绑定原操作、请求权限、持有及真实作用域。
+相同活动输入取得同一个令牌；改输入返回 Conflict，结束后的原请求不能重新取得
+资格。归还一次后只保留重放所需记录，不再持有代码；原作用域彻底退出后可回收。
+
+来源维护进度（source maintenance）有独立待办标记和在途操作。一次有界推进启用
+新编号，锁外调用；期间产生的新工作继续记录。来源退役（source retirement）先
+固定原请求与实际控制操作并关闭新业务。未进入独占时允许合法 READ／CLEANUP
+重入和既有归还。有其它活动调用或维护（maintenance）时返回 Busy。独占检查期间
+只准当前同步检查线程、同一来源登记一个新诊断，并保存完整持有供返回时核对。
+同持有可重放，其它访问不开始。有持有或返回与所登记诊断不符时不能确认退出；
+通过核验且全部实际保护归还后，才持独占归还上下文一次。未齐则解除独占并保持退役进度。
+明确检查失败时保留原分类，解除独占后交付本次合法登记的诊断。终局重放从
+宿主记录返回已有失败。需要本地报告时用宿主已拥有的数据；C 重放缺少可
+重新交付的诊断时，保留原操作类别和首次有限结果的非零次级类别。首次交付完整
+诊断的终局重放用 InvalidState 作为次级类别，归零整份诊断字段。原结果可能在来源尚未写入重放记录时
+产生，终局后不再通过来源检查取报告。上下文释放失败或结果不明时保存宿主
+错误，停用相关地址。
 
 申请安装时先占实际文件；系统返回后以活身份确认，再与可信构建匹配。读取
 元信息用装入调用持有的模块。额外系统引用或装入后拒绝均显式归还，失败留记录。

@@ -2,14 +2,14 @@
 
 `pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、初始化、维护、关闭和卸载符合约定的 Rust 插件动态库（plugin dynamic library），安全交接初始化入参并支持运行时（runtime）替换。本库提供插件在标准初始化时汇总并登记其静态服务（static service）的接入。
 
-**当前仓库包含设计骨架（design skeleton）。** 四个运行期库和可选编译期宏已提供入口声明。完整插件运行能力以相应发布版本的验证结果为准。
+**使用状态。** 两平台的完整插件运行能力尚未验证。
 
 工作区（workspace）各库的职责如下。
 
 | 库（crate） | 当前职责 |
 | --- | --- |
 | [pi_ffi_abi](crates/pi_ffi_abi/README.md) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
-| [pi_ffi_core](crates/pi_ffi_core/README.md) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
+| [pi_ffi_core](crates/pi_ffi_core/README.md) | 受控对象交接、调用保护、错误诊断及清理 |
 | [pi_ffi_adapters](crates/pi_ffi_adapters/README.md) | 运行时（runtime）、配置（Config）和 P2P 终端（terminal）的接入 |
 | [pi_ffi](crates/pi_ffi/README.md) | 宿主（host）管理和插件的三个标准入口 |
 | [pi_ffi_macros](crates/pi_ffi_macros/README.md) | 可选过程宏（procedural macro），在编译期生成标准导出 |
@@ -30,7 +30,7 @@
 
 插件可以没有服务，也可以使用静态服务（static service）或动态服务（dynamic service）。插件在标准初始化时汇总本插件的静态声明，并交给既有服务框架登记。空集合也可使用相同入口。服务的实现和使用由插件负责，并依照传入的 P2P 服务终端（P2P service terminal）与原框架的约定。封装者通过 `pi_ffi::service::register_static` 把本插件完整的静态声明交给配用框架，在本轮保留真实登记标识并在关闭时撤回。共享终端上的框架须具备批量登记、撤回与确认引用退出的能力。
 
-运行时（runtime）替换属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
+宿主通过 `pi-async-runtime-core` 的标准特征（trait）提供运行时（runtime）。满足合同的线程安全共享实例可以来自阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库为插件封装共享和克隆（clone）。原实例只需满足下列特征及线程安全要求。
 
 提供运行时（runtime）时，所需能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。插件普通任务（task）的异步计算（Future）按原生 Rust 派发合同使用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）用于原有本地上下文（context），合法条件由运行时库（runtime library）规定。空闲提交、等待、取消请求（cancellation request）及结果处理沿用运行时库的 Rust 接口（API）。
 
@@ -236,8 +236,6 @@ fn main() -> pi_result::Result<()> {
 
 ## 插件实现方的服务接入与清理注意事项
 
-插件通过既有服务框架提供异步远程过程调用（asynchronous RPC），其接口（API）和行为由插件及框架维护，对本库完全透明。标准管理导出层无需提供通用 Rust 异步计算（Future）或轮询（poll）／唤醒（wake-up）协议；内部运行时（runtime）封装仍须定义必要安全合同，不增加业务查询、任务进度或服务控制入口。
+插件通过既有服务框架提供异步远程过程调用（asynchronous RPC），其接口（API）和行为由插件及框架维护，对本库完全透明。插件使用既有运行时（runtime）的 Rust 接口推进内部异步计算。三个标准管理入口以同步方式调用。
 
 插件实现方负责让自身任务（task）、服务调用（service invocation）及相关资源真正退出；不得在推进这些工作的唯一执行线程（executor thread）上阻塞等待其完成。本库调用标准关闭并依据结果及受控代码持有推进最终卸载（unloading），不枚举或关闭业务服务（business service）。静态登记（static registration）可以被发现，不代表最终卸载（unloading）已经安全。
-
-后续可将 `pi_db_server` 等既有库包装为合规外部产物，并作为真实集成示例（integration example）。包装方应尽量保持原有接口（API），同时完整保持全部服务接口（service API）、语义（semantics）和逻辑（logic）；当前尚未验证其完整初始化与退出路径。

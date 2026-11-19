@@ -339,7 +339,7 @@ fn io_error(failure: std::io::Error, path: &Path) -> Error {
 }
 
 pub(super) fn open(files: &VerifiedFiles) -> Result<NativeModule> {
-    todo!("有已登记恢复位置才用平台单次参数装入。获取一个真实系统引用，保存已检查的装入条件识别错误。")
+    todo!("有已登记恢复位置才用平台单次参数装入。只取得一个真实系统引用；经 into_raw/from_raw 保存同一非拥有句柄与唯一系统拥有者，成功路径没有中间的可失败解析。")
 }
 
 pub(super) fn verify_image(
@@ -367,7 +367,7 @@ pub(super) fn verified_file_identity(files: &VerifiedFiles) -> FileIdentity {
 
 pub(super) fn mapped_identity(module: &NativeModule) -> Result<MappedIdentity> {
     todo!(
-        "Linux 取得本次活 link_map，Windows 取得本次 HMODULE。系统持有仍在，不解引用任何标准入口。"
+        "从本次系统引用借用真实句柄。Linux 以 dlinfo 从该句柄取得活 link_map，Windows 用同一 HMODULE；期间不调用或使用标准导出作身份依据。"
     )
 }
 

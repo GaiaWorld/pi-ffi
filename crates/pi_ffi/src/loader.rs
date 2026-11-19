@@ -65,22 +65,40 @@ struct MappedDependency {
     file: FileIdentity,
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+type NativeHandle = *mut core::ffi::c_void;
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+type NativeHandle = isize;
+
 /// 一个真实且需明确释放的系统引用。
 pub(crate) struct NativeModule {
     system: ManuallyDrop<SystemLibrary>,
+    // 与 system 同一本次装入。只有持有有效时才借用，不单独释放。
+    handle: NativeHandle,
 }
+
+// 安全前提：Linux 句柄（handle）是本条唯一系统引用内的系统值。
+// 移动记录不解引用该值，仍由相同的 libloading 引用持有并显式归还。
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+unsafe impl Send for NativeModule {}
 
 /*
 Linux 调用 dlopen 的 NOW | LOCAL，dlinfo 取得实际 link_map 并核实际路径／文件，
 dlsym 地址经 dladdr1 比对归属。校验区间基于所持模块的可读加载段。Windows
 用全路径 LoadLibraryExW 及单次调用 DLL_LOAD_DIR | SYSTEM32。按路径、打开
 文件的 FILE_ID 及实际 HMODULE 核对，GetModuleHandleExW 按地址确认入口归属。
+地址归属核对使用 FROM_ADDRESS | UNCHANGED_REFCOUNT；对返回的模块句柄只比较
+归属。局部将 libloading 的 isize 句柄按同一位值交给 windows-sys 的 HMODULE。
 用 VirtualQuery 核元信息可读区间。被借用的地址不脱离模块保护。
 
 装入前核读原文件、摘要、实际 ELF／PE x86_64 DLL／共享对象、三个直接导出及
 依赖。构建及部署前提覆盖平台运行的构造器和 inventory 私有表。配套 Rust 核验
 使用宿主构建记录及实际可见的相同依赖制品。程序映射表不替代导入绑定证明。
-移出 NativeModule 后只显式归还一次。禁止依赖默认 Drop 归还或吞掉系统错误。
+系统装入成功后经 libloading 的 into_raw/from_raw 无失败移回唯一引用，随引用
+保留实际句柄（handle）。不再次装入，不新增系统引用；移动回后才向上层交付。
+核对阶段只借用此句柄。移出 NativeModule 后只显式归还一次。禁止依赖默认
+Drop 归还或吞掉系统错误；系统释放开始后不再借用原句柄。
 */
 
 // @trace 1

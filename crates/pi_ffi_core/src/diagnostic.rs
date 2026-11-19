@@ -47,6 +47,8 @@ pub(crate) struct SnapshotFailure {
     pub(crate) operation: ErrorKind,
     /// 诊断建立阶段的独立失败分类。
     pub(crate) diagnostic: ErrorKind,
+    /// 格式化时捕获的本地值仍未确认清理。
+    pub(crate) cleanup_unconfirmed: bool,
 }
 
 /// 可重放的来源失败；原生Report的处理在来源边界完成后才提交此记录。
@@ -94,10 +96,13 @@ pub(crate) fn decode(connection: &Connection, outcome: OutcomeV1) -> Result<()> 
 /// 每次发送都新建独立诊断持有。
 pub struct ManagementFailure {
     pub(crate) cached: CachedFailure,
+    /// 原错误或诊断格式化过程含尚未确认的清理。
+    pub(crate) cleanup_unconfirmed: bool,
 }
 
 impl ManagementFailure {
     /// 在本地提取 pi_result 分类和三段诊断。
+    // 借用原报告。同步保留原报告或格式化过程传入的清理标记，由拥有来源的路径记录失败。
     // @trace 13
     pub fn capture(error: &Error) -> Self {
         inner::capture_management_failure(error)

@@ -34,11 +34,16 @@ pub struct Context {
 ///
 /// 调用者须先建立状态恢复及资源交接责任；捕获不证明业务状态可继续使用。
 /// 显式终止、分配器终止和不可恢复二次恐慌不属于恢复保证。
-// 本地步骤（local steps）：在本地产物捕获可展开恐慌；保留普通pi_result；只读取已知字符串负载，在独立保护内归还负载，无法确认时保留失败责任。
+// 本地步骤（local steps）：在本地产物捕获可展开恐慌；保留普通pi_result；只读取已知字符串负载，在独立保护内归还负载，无法确认时在本地报告附上 UnconfirmedPanicCleanup。
 // @trace 2
 pub fn catch<T>(context: Context, body: impl FnOnce() -> Result<T>) -> Result<T> {
     inner::catch::<T>(context, body)
 }
+
+// 本地 pi_result 报告携带的标记。捕获值的清理未确认时，由拥有来源的调用路径保留现有失败记录。
+// @trace 16
+#[derive(Debug)]
+pub(crate) struct UnconfirmedPanicCleanup;
 
 /// C边界（C boundary）的最外层保护；诊断建立再次失败时返回双分类分支。
 ///

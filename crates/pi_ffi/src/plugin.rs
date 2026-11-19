@@ -47,8 +47,8 @@ struct PluginRound<S> {
     phase: PluginPhase,
     state: Option<S>,
     source: Option<Arc<Registry>>,
-    init_failure: Option<ManagementFailure>,
-    close_failure: Option<ManagementFailure>,
+    init_failure: Option<Arc<ManagementFailure>>,
+    close_failure: Option<Arc<ManagementFailure>>,
 }
 
 struct BoundInputs {
@@ -77,7 +77,8 @@ enum PluginPhase {
 当前调用中唯一借出。已开始的关闭尚未退出时报 Busy，存回实际状态供后续
 推进。关闭完成后才在锁外销毁 S。恐慌或结果不明保留后续责任，禁止盲目重跑。
 
-本模块保存稳定诊断快照，不保存已移交的诊断句柄。新一次合法报告在本轮
+本模块保存共享的不可变诊断快照，不保存已移交的诊断句柄。短锁内只复制
+快照或来源的共享持有，锁外建立、报告或最后销毁快照。新一次合法报告在本轮
 有效 Registry 下建立独立诊断。配置未能建立连接时，边界错误返回双分类，
 宿主结合实际失败步骤报告。明确未开始或插件关闭成功时，锁内移出当前插件
 持有的诊断来源，写好最后一次结果和无持有快照后在锁外归还。重复调用使用

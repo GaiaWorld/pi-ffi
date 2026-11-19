@@ -97,7 +97,7 @@ pub(super) fn authority_maintain(
     round: Option<InitIdV1>,
     budget: usize,
 ) -> Result<usize> {
-    todo!("在已有记录内有界推进持有和来源退役，先取唯一资格再锁外调用。已有明确定义的待系统释放可在锁外推进。先推进持有配置的插件诊断来源退出，再确认依赖的配置来源。确认原轮全部清理才结束版本占用，保留不明释放及持有。")
+    todo!("按既有记录有界推进。对象归还用预留编号，诊断归还取得单次资格。维护（maintenance）保留待办及在途编号；一次新推进换号。退役检查复用专用控制编号并独占来源。锁外执行回调。已有明确定义的待系统释放可在锁外推进。先推进持有配置的插件诊断来源退出，再确认依赖的配置来源。确认原轮全部清理才结束版本占用，保留不明释放及持有。")
 }
 
 pub(super) unsafe fn next_operation(context: *mut c_void, out: *mut OperationIdV1) -> u32 {
@@ -114,7 +114,7 @@ pub(super) unsafe fn register_source(
 }
 
 pub(super) unsafe fn track_holding(context: *mut c_void, target: CallTargetV1) -> u32 {
-    todo!("保护有限状态回调，按来源、实际轮次和 target 登记唯一释放义务及模块存续，完成后才可发布原生持有。")
+    todo!("保护有限状态回调，按来源、实际轮次和 target 预留唯一释放义务、宿主操作编号及代码存续；重复登记同完整持有复用已有记录。独占时只允许本次检查线程和来源登记一个诊断，记录持有用于核返回。成功后才允许发布。")
 }
 
 pub(super) unsafe fn enter_call(
@@ -124,11 +124,11 @@ pub(super) unsafe fn enter_call(
     rights: u64,
     out: *mut CallTokenV1,
 ) -> u32 {
-    todo!("保护有限状态回调，从完整已登记持有取得当前来源真实代码保活，核该权限。先登记令牌才允许解引用来源表。")
+    todo!("保护有限状态回调，核真实作用域、完整持有、来源和权限。按原操作、目标和权限重复确认同一逻辑调用，不新增令牌拥有者；改输入拒绝，已结束的请求不可重开。先登记活动资格再允许解引用。")
 }
 
 pub(super) unsafe fn leave_call(context: *mut c_void, token: CallTokenV1) -> u32 {
-    todo!("保护有限状态回调，按同 actor、来源及真实调用只归还一次。失败保持关联代码至收尾确认。")
+    todo!("保护有限状态回调，按原作用域、来源及令牌结束活动资格一次。保留已完成重放信息但不持有代码。需要推进来源时保留待办；失败保留尚未确认为结束的保护。")
 }
 
 pub(super) unsafe fn request_release(context: *mut c_void, target: CallTargetV1) -> u32 {
@@ -142,7 +142,7 @@ pub(super) unsafe fn retire_source(
     source: u64,
     operation: OperationIdV1,
 ) -> OutcomeV1 {
-    todo!("保护完整回调，核原登记权威／轮次及同操作。锁外实际推进 maintain、try_retire、release_context。成功后归还来源代码，未知状态持久报告。")
+    todo!("保护完整回调，核原登记权威、轮次、来源与原操作；接纳时先记原请求和控制编号并关闭新业务。独占前保留合法读和清理。有其它活动调用或维护则 Busy。核实际结果与本次独占登记匹配，解除独占后再交合法诊断；终局失败由宿主记录重放，不借检查读取诊断；有限失败保留原类别，次级取首次有限结果的非零类别或 InvalidState，诊断字段全零。上下文归还仅一次，结果不明停用地址。")
 }
 
 pub(super) fn round_call_drop(call: &mut RoundCall) {

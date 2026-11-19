@@ -21,7 +21,9 @@ pub(super) fn catch<T>(context: Context, body: impl FnOnce() -> Result<T>) -> Re
                 ))
                 .attach(detail);
             if !dispose_payload(payload) {
-                error = error.attach("恐慌负载（panic payload）的析构（drop）结果不明");
+                error = error
+                    .attach("恐慌负载（panic payload）的析构（drop）结果不明")
+                    .attach_opaque(UnconfirmedPanicCleanup);
             }
             Err(error)
         }

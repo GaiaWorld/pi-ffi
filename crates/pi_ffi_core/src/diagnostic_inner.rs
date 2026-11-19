@@ -1,6 +1,6 @@
 // 本地实现入口（local implementation entry）；关键类型由父模块声明。
 use super::*;
-use crate::boundary::{self, Context, DiagnosticKindMismatch};
+use crate::boundary::{self, Context, DiagnosticKindMismatch, UnconfirmedPanicCleanup};
 use pi_ffi_abi::{CallTargetV1, InitIdV1, LeaseV1, ObjectKeyV1, TARGET_DIAGNOSTIC};
 
 pub(super) fn copied_diagnostic(error: &Error) -> Option<&CopiedDiagnostic> {
@@ -30,6 +30,7 @@ pub(super) fn snapshot(error: &Error) -> core::result::Result<Snapshot, Snapshot
     .map_err(|diagnostic| SnapshotFailure {
         operation: kind,
         diagnostic: *diagnostic.current_context(),
+        cleanup_unconfirmed: diagnostic.downcast_ref::<UnconfirmedPanicCleanup>().is_some(),
     })
 }
 
@@ -117,14 +118,21 @@ pub(super) fn decode(connection: &Connection, outcome: OutcomeV1) -> Result<()> 
 }
 
 pub(super) fn capture_management_failure(error: &Error) -> ManagementFailure {
+    let mut cleanup_unconfirmed = error.downcast_ref::<UnconfirmedPanicCleanup>().is_some();
     let cached = match super::snapshot(error) {
         Ok(snapshot) => CachedFailure::Complete(Arc::new(snapshot)),
-        Err(failure) => CachedFailure::Unavailable {
-            operation: failure.operation,
-            diagnostic: failure.diagnostic,
-        },
+        Err(failure) => {
+            cleanup_unconfirmed |= failure.cleanup_unconfirmed;
+            CachedFailure::Unavailable {
+                operation: failure.operation,
+                diagnostic: failure.diagnostic,
+            }
+        }
     };
-    ManagementFailure { cached }
+    ManagementFailure {
+        cached,
+        cleanup_unconfirmed,
+    }
 }
 
 pub(super) fn management_failure_without_source(failure: &ManagementFailure) -> OutcomeV1 {

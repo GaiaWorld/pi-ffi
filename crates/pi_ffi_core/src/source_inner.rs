@@ -26,6 +26,7 @@ pub(super) fn registry_attach(connection: Connection) -> Result<Registry> {
         state: Mutex::new(State {
             source: 0,
             phase: SourcePhase::Registering,
+            retirement_request: RetirementRequest::Unassigned,
             next_slot: 1,
             next_holding: 1,
             entries: Vec::new(),
