@@ -79,11 +79,22 @@ pub struct BuildManifest {
     pub static_declarations: StaticDeclarations,
 }
 
+// 装入（load）和同一实际制品的复用均核对这一选择；不可在持有映像期间更改。
+// @trace 6
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum UnloadPolicy {
+    // 退役管理代（management generation）后仍持有实际引用至进程退出。
+    RetainUntilExit,
+    // 完成本轮并退出本库的实际持有后允许显式归还。
+    ReleaseWhenQuiescent,
+}
+
 /// 宿主已确认可供本进程接纳的一个已部署插件包。
 #[derive(Clone)]
 pub struct PluginPackage {
     root: Arc<Path>,
     manifest: Arc<BuildManifest>,
+    unload_policy: UnloadPolicy,
 }
 
 /// 必须同时满足插件身份和版本要求。
@@ -103,14 +114,45 @@ pub struct Metadata {
 impl PluginPackage {
     /// 从宿主管理的可信部署记录建立候选插件包。
     ///
+    /// `root` 是可信部署根，`manifest` 指向实际构建及其配套文件。返回的包
+    /// 使用默认卸载规则。成功装入后，退役管理代时保留本库的实际系统引用
+    /// （system reference），供操作系统在进程退出时执行剩余收尾。
+    /// 此入口检查部署路径，可能访问文件系统，调用本身不执行插件代码。
+    /// 已装入且被拒的制品依其已知引用与核验结果处理。
+    ///
     /// # Safety
     ///
     /// 调用者已确认原生代码遵约，实际构建和分配器匹配，且受管制品、
     /// 共享依赖与进程加载条件在使用期间稳定。不得用任意文件填充此保证。
+    /// 加载失败且系统未交付引用时，构造和失败收尾不得留下随后需执行的插件代码。
     /// 本库随后检查文件、映像及标准入口的实际身份。
     // @trace 1
     pub unsafe fn from_verified_build(root: PathBuf, manifest: BuildManifest) -> Result<Self> {
         unsafe { inner::package_from_verified_build(root, manifest) }
+    }
+
+    /// 为有实际验证依据的配套构建（matching build）选择提前卸载（unloading）。
+    ///
+    /// 参数、部署路径检查和返回包同 [`Self::from_verified_build`]。取得此包不装入
+    /// 动态库或发布服务。已结束插件工作且本库归还相关持有后，
+    /// [`crate::host::Plugin::unload`] 可以显式归还本库拥有的系统引用。
+    /// 操作系统仍可能因其它持有者而保留映像。
+    ///
+    /// # Safety
+    ///
+    /// 满足 [`Self::from_verified_build`] 的全部前提。调用者还须验证目标平台、
+    /// 实际制品、配套依赖和该包在安全接口（safe API）下的全部使用，包括所有克隆、
+    /// 后续轮次的输入、业务拒绝、部分失败、重试和关闭。制品须在产生影响卸载的效果
+    /// 前拒绝超出验证范围的输入，或证明这些输入的失败收尾同样安全。
+    /// 本库归还引用前，所有仍需使用映像的工作、回调、任务和线程局部存储（TLS）
+    /// 收尾均须退出。系统终止回调须可安全完成，之后不得留下仍需本映像的任务。
+    /// 上述保证随实际构建绑定，并须在包和由其取得的所有管理入口的使用期间成立。
+    // @trace 4
+    pub unsafe fn from_verified_unloadable_build(
+        root: PathBuf,
+        manifest: BuildManifest,
+    ) -> Result<Self> {
+        unsafe { inner::package_from_verified_unloadable_build(root, manifest) }
     }
 }
 
@@ -123,5 +165,10 @@ impl PluginPackage {
     // @trace 3
     pub(crate) fn manifest(&self) -> &BuildManifest {
         inner::package_manifest(self)
+    }
+
+    // @trace 5
+    pub(crate) fn unload_policy(&self) -> UnloadPolicy {
+        inner::package_unload_policy(self)
     }
 }

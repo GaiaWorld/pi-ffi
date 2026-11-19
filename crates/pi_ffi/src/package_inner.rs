@@ -64,7 +64,19 @@ pub(super) unsafe fn package_from_verified_build(
     Ok(PluginPackage {
         root: Arc::from(root),
         manifest: Arc::new(manifest),
+        unload_policy: UnloadPolicy::RetainUntilExit,
     })
+}
+
+pub(super) unsafe fn package_from_verified_unloadable_build(
+    root: PathBuf,
+    manifest: BuildManifest,
+) -> Result<PluginPackage> {
+    todo!("沿可信部署路径核对和原错误处理。成功后只为此包确定可提前卸载的选择，再交付；过程中不装入系统模块。")
+}
+
+pub(super) fn package_unload_policy(package: &PluginPackage) -> UnloadPolicy {
+    todo!("只读取本包建立时绑定的卸载选择，保持 Clone 后的一致性。")
 }
 
 pub(super) fn package_root(package: &PluginPackage) -> &Path {

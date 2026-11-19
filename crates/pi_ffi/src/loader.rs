@@ -3,7 +3,7 @@
 #[path = "loader_inner.rs"]
 mod inner;
 
-use crate::package::{BuildManifest, HostBuild, Metadata, PluginPackage};
+use crate::package::{BuildManifest, HostBuild, Metadata, PluginPackage, UnloadPolicy};
 use pi_ffi_abi::management::{CloseFnV1, InitializeFnV1, MetadataFnV1, MetadataV1};
 use pi_result::Result;
 use std::{fs::File, mem::ManuallyDrop, path::PathBuf, sync::Arc};
@@ -39,6 +39,17 @@ pub(crate) struct VerifiedFiles {
     dependencies: Vec<VerifiedFile>,
 }
 
+// 已核主文件和配套文件的稳定资料。进程级保留记录只存数据和系统引用。
+// @trace 12
+pub(crate) struct VerifiedDeployment {
+    // 沿实际核验的清单、目标、版本和已绑定的卸载选择。
+    package: PluginPackage,
+    // 原始打开文件在目标平台的真实身份。
+    main: FileIdentity,
+    // 与清单中的配套文件顺序对应。对照时按目标平台的加载名匹配。
+    dependencies: Vec<FileIdentity>,
+}
+
 /// 当本库持续拥有本次系统持有时才可使用的实际模块身份。
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct MappedIdentity {
@@ -71,7 +82,7 @@ type NativeHandle = *mut core::ffi::c_void;
 #[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
 type NativeHandle = isize;
 
-/// 一个真实且需明确释放的系统引用。
+/// 系统实际交付的一份引用。可以在进程记录持有，或一次显式归还。
 pub(crate) struct NativeModule {
     system: ManuallyDrop<SystemLibrary>,
     // 与 system 同一本次装入。只有持有有效时才借用，不单独释放。
@@ -159,6 +170,38 @@ impl VerifiedFiles {
     // @trace 11
     pub(crate) fn matches_reuse(&self, candidate: &Self) -> bool {
         inner::verified_files_match_reuse(self, candidate)
+    }
+
+    // 把已打开文件的实际身份及必要可信资料复制到不含文件句柄（file handle）的记录。
+    // @trace 13
+    pub(crate) fn deployment(&self) -> Result<Arc<VerifiedDeployment>> {
+        inner::verified_files_deployment(self)
+    }
+
+    // @trace 14
+    pub(crate) fn unload_policy(&self) -> UnloadPolicy {
+        inner::verified_files_unload_policy(self)
+    }
+}
+
+impl VerifiedDeployment {
+    // @trace 15
+    pub(crate) fn identity(&self) -> FileIdentity {
+        inner::verified_deployment_identity(self)
+    }
+
+    // 按已核构建、完整插件身份、实际文件、依赖的用途和卸载选择逐项对照。
+    // @trace 16
+    pub(crate) fn matches_reuse(&self, candidate: &VerifiedFiles) -> bool {
+        inner::verified_deployment_match_reuse(self, candidate)
+    }
+}
+
+impl VerifiedImage {
+    // 核对实际映像和管理记录共同关联的是同一份文件持有。
+    // @trace 17
+    pub(crate) fn shares_files(&self, files: &Arc<VerifiedFiles>) -> bool {
+        inner::verified_image_shares_files(self, files)
     }
 }
 

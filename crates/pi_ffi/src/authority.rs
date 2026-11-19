@@ -4,7 +4,9 @@
 mod inner;
 
 use crate::{
-    loader::{Entrypoints, MappedIdentity, NativeModule, VerifiedFiles, VerifiedImage},
+    loader::{
+        Entrypoints, MappedIdentity, NativeModule, VerifiedDeployment, VerifiedFiles, VerifiedImage,
+    },
     package::{HostBuild, Metadata},
 };
 use parking_lot::Mutex;
@@ -28,6 +30,7 @@ static AUTHORITY: Authority = Authority {
         build: None,
         next_identifier: 1,
         modules: Vec::new(),
+        retained_images: Vec::new(),
         rounds: Vec::new(),
         sources: Vec::new(),
         holdings: Vec::new(),
@@ -53,20 +56,46 @@ struct State {
     build: Option<Arc<HostBuild>>,
     next_identifier: u64,
     modules: Vec<ModuleRecord>,
+    retained_images: Vec<RetainedImage>,
     rounds: Vec<RoundRecord>,
     sources: Vec<RegisteredSource>,
     holdings: Vec<HoldingRecord>,
     calls: Vec<CallRecord>,
 }
 
+// 已退役及正在移交的系统引用由进程记录持有。旧管理代留在 ModuleRecord。
+// 同一实际映像成功复用时，先下线原保留记录，再提交新管理代。
+// @trace 34
+struct RetainedImage {
+    // 本次保留来源的管理代，仅用来确认保留记录身份。
+    retired_epoch: u64,
+    // 无文件句柄（file handle）的已核资料。
+    deployment: Arc<VerifiedDeployment>,
+    // 与 Held 引用或当前登记的系统操作对应，只作身份比较。
+    mapped: MappedIdentity,
+    phase: RetentionPhase,
+}
+
+enum RetentionPhase {
+    // 原管理代关闭准入，引用和文件由其退役操作持有。
+    Retiring,
+    // 已确认归还核验文件，可以按已核构建重新接入。
+    Held(NativeModule),
+    // 新代等待核验，原引用已经移入此新代的系统操作。
+    Revalidating { epoch: u64 },
+}
+
 struct ModuleRecord {
     epoch: u64,
     // 装入准备到明确结束期间保有实际文件。确认结束后移出记录持有。
     files: Option<Arc<VerifiedFiles>>,
-    // 映像标识只在仍需要核对实际映像时保存。明确结束后清空。
+    // 只在仍有明确真实系统引用时用于映像关联。引用一旦进入可能失效的归还阶段，
+    // 该值退出匹配条件。已结束的保留映像身份归 RetainedImage。
     mapped: Option<MappedIdentity>,
     image: Option<Arc<VerifiedImage>>,
     library: Option<NativeModule>,
+    // 先保存从实际已核映像复制的元信息。装入中和隔离时只作身份及占用依据。
+    // 只有活动代可把与已批准清单匹配的元信息交付宿主。
     metadata: Option<Arc<Metadata>>,
     phase: ModulePhase,
     failure: Option<Arc<Error>>,
@@ -219,16 +248,31 @@ pub(crate) enum LoadAdmission {
 pub(crate) struct SystemOperation {
     authority: &'static Authority,
     epoch: u64,
-    files: Arc<VerifiedFiles>,
+    // 完成退役前先从操作及旧代移出并在锁外销毁文件持有。
+    // 未确认的失败保留已有证据；完成状态可以是 None。
+    files: Option<Arc<VerifiedFiles>>,
+    purpose: SystemPurpose,
     phase: SystemPhase,
     library: Option<NativeModule>,
+}
+
+// 已承接引用的操作按其许可和来源收口。旧的系统阶段不单独赋予释放资格。
+// @trace 36
+enum SystemPurpose {
+    Load,
+    Revalidate { retired_epoch: u64 },
+    Retire,
+    ReturnDuplicate { original_epoch: u64 },
 }
 
 enum SystemPhase {
     Reserved,
     Opening,
     OwnsReference,
+    // 已开始可能影响真实引用的系统归还。结果不明时只隔离。
     ReleasingReference,
+    // 系统明确确认归还，仍需完成进程记录和核验文件收口。
+    ReleaseConfirmed,
     Finished,
 }
 
@@ -297,11 +341,47 @@ pub(crate) enum RoundAdmission {
 产生，终局后不再通过来源检查取报告。上下文释放失败或结果不明时保存宿主
 错误，停用相关地址。
 
-申请安装时先占实际文件；系统返回后以活身份确认，再与可信构建匹配。读取
-元信息用装入调用持有的模块。额外系统引用或装入后拒绝均显式归还，失败留记录。
-释放不确定时材料和宿主错误持续存在，任意已失效入口立即停止使用。
-装入和释放的记录先于系统调用，SystemOperation 在核验、正常拒绝及展开时
-持有引用。销毁时只归回已确定的引用或标明不明结果，系统操作始终显式进行。
+归属与准入（ownership and admission）。装入前先核真实文件，再在短锁内查
+活动、正在变更、已保留及隔离记录。活动复用在锁内取得原文件和实际映像的 Arc，
+锁外核配套，再在锁内验同一有效代。已保留映像先取无句柄资料，锁外核候选。
+二次入锁仍是原保留记录且允许接入时，预留新代并把原引用移入其 SystemOperation；
+操作持有至核对或错误收口，禁止重复装入。新代重新核实际映像、依赖、入口和
+元信息，成功才发布。材料对照失败不改变保留记录。无法确认实际映像时隔离所持引用。
+
+退役（retirement）。先核旧轮、未退出的来源和持有、回调、标准调用均已结束，
+再核本代直接文件持有与映像内文件属于同一 Arc。仍有外部核验或调用持有其 Arc
+时返回 Busy。全部外借从同一短锁取得；检查该映像只有管理记录的一份引用，
+文件只有管理记录与映像的两份引用。锁内关闭新准入后再移动持有。下游析构和
+平台操作均在锁外。装入、核验及归还资格按管理代检查。
+
+退役操作按包选择分支。默认在归还文件前预留保留记录，以便失败前恢复原管理代。
+在旧代仍处于退役时移出并销毁核验文件及可调用入口资料，含操作自己的一份文件
+持有。锁内将同一系统引用移到保留记录，发布旧代完成和保留可用。调用者依旧代
+记录重放，未完成的移交返回 Busy。提前卸载仅在实际已核制品和原轮满足前提时
+由锁外系统调用一次；确认后以同样次序归还文件并完成旧代。
+
+加载失败（load failure）。确认未取得引用则按原结果结束预留。已取得而缺少
+释放依据则在预留记录保留引用和原错误，关闭相关地址。已从实际映像复制出的
+完整 UUID／SemVer 先入记录，再判定清单和请求。隔离以实际及已批准的各相关
+身份保持占用：无实际身份时按该次已批准清单；不同则同时保持两组。
+新轮次准入和已准备轮次首次正式初始化都核此占用。其它已开始轮次若映像和
+调用资格仍经确认，可按原权限关闭。只有完整核验的冗余引用
+能在主引用受保护时归还；原活动代的文件和映像 Arc 持有至系统结果已经收录，
+发生展开时也比该冗余操作后退出。主引用保护已失时只保留冗余引用，不启用归还。
+保留映像重核失败时，短锁内把原 Revalidating 条目的有界责任和仍有的系统引用
+交给新操作对应的隔离记录，再移除原重核条目；原退役代的结果仍可重放。
+
+系统归还开始前，清除该操作项用于匹配的映像地址。只有同一实际引用或仍在用的
+原主引用可证明映像关联。未确认的返回依原已核文件、版本和受保护关系隔离，
+旧地址不得用于匹配新装入的制品。已确认归还先记 ReleaseConfirmed，再锁外结束
+文件持有，记录只作最终确认，不重新调用平台。
+
+退出与维护（drop and maintenance）。普通装入、保留映像重核及冗余引用的已知
+中断保留实际引用并隔离，均不排入维护释放。退役的系统动作尚未发生且文件仍在
+原记录时，可将实际引用放回原记录，设 AwaitingRelease 继续原动作。默认退役已
+移出所有核验文件且保留记录已预留时，文件和映像的局部对象在操作的析构前结束。
+析构凭原 Retiring 条目和原代完成 Held 移交。系统已确认归还时只结束核验材料
+及确认旧代。其它不可确认的阶段保留已知引用及失败。维护只取 AwaitingRelease。
 
 本轮先预留真实进度和诊断接管，来源退役按实际持有。已知插件关闭后只推进本库
 清理。类 Busy 的结果无阻塞，优先保留原错误分类及已发生效果，重放时不会安插
@@ -379,6 +459,7 @@ impl Authority {
         inner::authority_finish_round(self, call, result)
     }
 
+    // 按旧代核对全部作用域及映像、文件持有；原结果可重放。
     // @trace 13
     pub(crate) fn prepare_unload(&'static self, epoch: u64) -> Result<Option<SystemOperation>> {
         inner::authority_prepare_unload(self, epoch)
@@ -453,6 +534,7 @@ impl SystemOperation {
         inner::system_epoch(self)
     }
 
+    // 预留的普通装入才调用平台；已登记复用切换到同一现有系统引用。
     // @trace 27
     pub(crate) fn open(&mut self) -> Result<()> {
         inner::system_open(self)
@@ -463,6 +545,14 @@ impl SystemOperation {
         inner::system_library(self)
     }
 
+    // 只有本次装入操作可记录从当前已核映像复制的完整身份。
+    // 先保存事实，再由宿主核清单与请求；失败诊断不承担身份存储。
+    // @trace 35
+    pub(crate) fn record_metadata(&self, metadata: &Metadata) -> Result<()> {
+        inner::system_record_metadata(self, metadata)
+    }
+
+    // 只在实际映像、完整身份及原持有仍相符时发布，或确认并返回原活动代。
     // @trace 29
     pub(crate) fn confirm_loaded(
         self,
@@ -472,11 +562,20 @@ impl SystemOperation {
         inner::system_confirm_loaded(self, image, metadata)
     }
 
+    // 锁外组合原错误，先按已知实际结果收录所持引用，停止未核对的地址。
     // @trace 30
     pub(crate) fn reject(self, cause: Error) -> Error {
         inner::system_reject(self, cause)
     }
 
+    // 继续系统已确认归还的操作。只退还本次的核验材料并确认原记录。
+    // 此入口的失败亦由原记录保全，供调用方和晚到请求取得。
+    // @trace 37
+    fn finish_confirmed_release(&mut self) -> Result<()> {
+        inner::system_finish_confirmed_release(self)
+    }
+
+    // 在既有退役保护中保留引用或归还具备资格的引用，归还文件后确认旧代结束。
     // @trace 31
     pub(crate) fn release(self) -> Result<()> {
         inner::system_release(self)

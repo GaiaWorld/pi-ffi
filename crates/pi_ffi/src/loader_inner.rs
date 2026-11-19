@@ -941,6 +941,32 @@ pub(super) fn verified_files_match_reuse(
     })
 }
 
+pub(super) fn verified_files_deployment(files: &VerifiedFiles) -> Result<Arc<VerifiedDeployment>> {
+    todo!("在锁外从已核文件复制主文件和配套文件的真实身份，以及同一包的可信清单。依赖身份与清单同序。为集合提前预留空间，失败报 ResourceExhausted；结果中不携带实际打开文件、映像或可调用入口。")
+}
+
+pub(super) fn verified_files_unload_policy(files: &VerifiedFiles) -> UnloadPolicy {
+    todo!("经 PluginPackage 的 Rust 入口取已绑定的卸载选择。")
+}
+
+pub(super) fn verified_deployment_identity(deployment: &VerifiedDeployment) -> FileIdentity {
+    todo!("只返回已核的主文件身份。")
+}
+
+pub(super) fn verified_deployment_match_reuse(
+    deployment: &VerifiedDeployment,
+    candidate: &VerifiedFiles,
+) -> bool {
+    todo!("复用已核文件的比较规则。对照目标、完整 UUID 与版本、主文件身份及摘要、配套构建及分配器、静态声明归属、卸载选择和全部依赖的实际文件身份、摘要、加载名和用途。按加载名配对，顺序与同文件路径别名不改变结果；不访问平台或保留文件句柄。")
+}
+
+pub(super) fn verified_image_shares_files(
+    image: &VerifiedImage,
+    files: &Arc<VerifiedFiles>,
+) -> bool {
+    todo!("只确认实际映像的文件持有与记录中的 Arc 属于同一分配。")
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[repr(C)]
 struct ElfLinkMapPrefix {

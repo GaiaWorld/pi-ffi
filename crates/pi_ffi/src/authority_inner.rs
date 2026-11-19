@@ -609,8 +609,11 @@ pub(super) fn system_open(operation: &mut SystemOperation) -> Result<()> {
             None,
         ));
     }
+    let files = operation.files.as_deref().ok_or_else(|| {
+        module_error(ErrorKind::Corrupted, "read reserved module files", None)
+    })?;
     operation.phase = SystemPhase::Opening;
-    match loader::open(&operation.files) {
+    match loader::open(files) {
         Ok(module) => {
             operation.library = Some(module);
             operation.phase = SystemPhase::OwnsReference;
@@ -635,6 +638,13 @@ pub(super) fn system_library(operation: &SystemOperation) -> Result<&NativeModul
     ))
 }
 
+pub(super) fn system_record_metadata(
+    operation: &SystemOperation,
+    metadata: &Metadata,
+) -> Result<()> {
+    todo!("只接受拥有实际引用且映像归属已经核实的本次装入操作。在锁外准备宿主元信息副本，短锁内校验原代仍在装入中且映像匹配，再保存完整 UUID 和版本。接受相同值的重放；不同值报告 Conflict。锁外结束未采用副本。此记录不授予调用许可。")
+}
+
 pub(super) fn system_confirm_loaded(
     operation: SystemOperation,
     image: VerifiedImage,
@@ -655,7 +665,11 @@ pub(super) fn system_confirm_loaded(
             Ok(ModuleView { epoch, metadata })
         }
         Ok(LoadConfirmation::Reuse(original)) => {
-            if let Err(failure) = compare_reuse(&original, &operation.files) {
+            let Some(files) = operation.files.as_deref() else {
+                let failure = module_error(ErrorKind::Corrupted, "read reserved module files", None);
+                return Err(operation.reject(failure));
+            };
+            if let Err(failure) = compare_reuse(&original, files) {
                 return Err(operation.reject(failure));
             }
             operation.release()?;
@@ -684,6 +698,10 @@ pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
             confirm_no_reference(&mut operation, Some(Arc::clone(&original)));
             replay_module_failure(original, "reject native load")
         }
+        SystemPhase::ReleaseConfirmed => match operation.finish_confirmed_release() {
+            Ok(()) => cause,
+            Err(failure) => cause.attach(RecordedFailure(Arc::new(failure))),
+        },
         SystemPhase::Opening | SystemPhase::ReleasingReference => {
             let original = Arc::new(cause);
             quarantine_mapping(&mut operation, Some(Arc::clone(&original)));
@@ -696,6 +714,10 @@ pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
 pub(super) fn system_release(operation: SystemOperation) -> Result<()> {
     let mut operation = operation;
     release_reference(&mut operation, None)
+}
+
+pub(super) fn system_finish_confirmed_release(operation: &mut SystemOperation) -> Result<()> {
+    todo!("仅处理原 SystemOperation 的 ReleaseConfirmed。确认归还事实和原用途，不再调用加载器。在短锁内移出本操作及对应记录的核验文件和映像资料，锁外归还所有持有，回锁确认该代结束。若原登记不相符，保存已确认的系统结果和本地失败，停用该记录的地址。成功仅发布一次，重放保持结果。")
 }
 
 fn release_reference(
@@ -736,6 +758,10 @@ pub(super) fn system_operation_drop(operation: &mut SystemOperation) {
         SystemPhase::Reserved => confirm_no_reference(operation, None),
         SystemPhase::Opening | SystemPhase::ReleasingReference => {
             quarantine_mapping(operation, None);
+        }
+        SystemPhase::ReleaseConfirmed => {
+            // 原记录仍保存归还确认。补完资料及记录步骤，失败也保存在原记录。
+            drop(operation.finish_confirmed_release());
         }
         SystemPhase::OwnsReference => {
             let mut state = operation.authority.state.lock();
@@ -933,7 +959,8 @@ fn reserve_load_record(
     Ok(SystemOperation {
         authority,
         epoch,
-        files: Arc::clone(files),
+        files: Some(Arc::clone(files)),
+        purpose: SystemPurpose::Load,
         phase: SystemPhase::Reserved,
         library: None,
     })
@@ -1060,7 +1087,8 @@ fn prepare_unload_record(
     Ok(Some(SystemOperation {
         authority,
         epoch,
-        files,
+        files: Some(files),
+        purpose: SystemPurpose::Retire,
         phase: SystemPhase::OwnsReference,
         library: Some(library),
     }))
@@ -2302,7 +2330,8 @@ fn next_maintenance(
             return Ok(Some(MaintenanceWork::ReleaseModule(SystemOperation {
                 authority,
                 epoch: record.epoch,
-                files,
+                files: Some(files),
+                purpose: SystemPurpose::Retire,
                 phase: SystemPhase::OwnsReference,
                 library: Some(library),
             })));
