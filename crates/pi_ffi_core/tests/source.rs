@@ -1,8 +1,9 @@
 use parking_lot::Mutex;
 use pi_ffi_abi::{
-    ApiHeaderV1, CallTargetV1, CallTokenV1, HostControlApiV1, InitIdV1, InterfaceRequestV1,
-    InterfaceViewV1, LeaseV1, ObjectKeyV1, ObjectRefV1, OperationIdV1, OutcomeV1,
-    SourceDescriptorV1, UuidV1, TARGET_DIAGNOSTIC, TARGET_OBJECT,
+    ApiHeaderV1, CallTargetV1, CallTokenV1, DiagnosticApiV1, DiagnosticInfoV1, DiagnosticRefV1,
+    HostControlApiV1, InitIdV1, InterfaceRequestV1, InterfaceViewV1, LeaseV1, ObjectKeyV1,
+    ObjectRefV1, OperationIdV1, OutcomeV1, SourceApiV1, SourceDescriptorV1, UuidV1,
+    TARGET_DIAGNOSTIC, TARGET_OBJECT,
 };
 use pi_ffi_core::{
     control::Connection,
@@ -484,4 +485,263 @@ fn test_registry_diagnostic_can_outlive_source() -> Result<()> {
         assert_eq!(saved.debug, pi_result::debug_message(&original));
     }
     Ok(())
+}
+
+/// 输入引导（input bootstrap）在实际来源保护内先拒绝矛盾分类，同时归还诊断持有。
+#[test]
+fn test_bootstrap_rejects_mismatched_kind_before_copy() {
+    let source = DiagnosticWire::new(15, 5);
+    let failure = source.bootstrap();
+    assert_eq!(failure.current_context(), &ErrorKind::Corrupted);
+    assert_eq!(source.info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(source.copy_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(source.release_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(source.released.load(Ordering::Relaxed), 1);
+    assert_eq!(source.endpoint.drain_requested(), 1);
+    assert_eq!(source.release_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(source.released.load(Ordering::Relaxed), 1);
+    let message = pi_result::debug_message(&failure);
+    assert!(message.contains("（operation kind）15"), "{message}");
+    assert!(message.contains("（diagnostic kind）5"), "{message}");
+}
+
+/// 标准管理入口（standard management entry）比较原编号，即使两编号均投影为 Other。
+#[test]
+fn test_management_rejects_mismatched_raw_kinds_before_copy() -> Result<()> {
+    let source = DiagnosticWire::new(88_601, 99_702);
+    let failure = source.managed()?;
+    assert_eq!(failure.current_context(), &ErrorKind::Corrupted);
+    assert_eq!(source.info_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(source.copy_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(source.release_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(source.released.load(Ordering::Relaxed), 0);
+    assert!(source.endpoint.registry.lock().calls.is_empty());
+    assert_eq!(source.endpoint.drain_requested(), 1);
+    assert_eq!(source.endpoint.drain_requested(), 0);
+    assert_eq!(source.release_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(source.released.load(Ordering::Relaxed), 1);
+    let message = pi_result::debug_message(&failure);
+    assert!(message.contains("（operation kind）88601"), "{message}");
+    assert!(message.contains("（diagnostic kind）99702"), "{message}");
+    Ok(())
+}
+
+/// 正常读取失败（read failure）作为次级诊断，两个入口均保留原操作分类和归还义务。
+#[test]
+fn test_diagnostic_read_failure_preserves_operation_kind() -> Result<()> {
+    for bootstrap in [true, false] {
+        let mut source = DiagnosticWire::new(15, 15);
+        source.info_status = diagnostic::status_code(ErrorKind::Io);
+        let failure = if bootstrap {
+            source.bootstrap()
+        } else {
+            source.managed()?
+        };
+        assert_eq!(failure.current_context(), &ErrorKind::Dependency);
+        let message = pi_result::debug_message(&failure);
+        assert!(message.contains("diagnostic.info"), "{message}");
+        assert_eq!(source.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(source.copy_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(source.endpoint.drain_requested(), 1);
+        assert_eq!(source.released.load(Ordering::Relaxed), 1);
+    }
+    Ok(())
+}
+
+/// 提供可观察的独立 C 诊断（independent C diagnostic）和既有归还记录。
+struct DiagnosticWire {
+    endpoint: Arc<Endpoint>,
+    operation_kind: u32,
+    reported_kind: u32,
+    info_status: u32,
+    info_calls: AtomicUsize,
+    copy_calls: AtomicUsize,
+    release_calls: AtomicUsize,
+    released: AtomicUsize,
+}
+
+impl DiagnosticWire {
+    fn new(operation_kind: u32, reported_kind: u32) -> Self {
+        Self {
+            endpoint: Arc::new(Endpoint::default()),
+            operation_kind,
+            reported_kind,
+            info_status: 0,
+            info_calls: AtomicUsize::new(0),
+            copy_calls: AtomicUsize::new(0),
+            release_calls: AtomicUsize::new(0),
+            released: AtomicUsize::new(0),
+        }
+    }
+
+    fn bootstrap(&self) -> Error {
+        let seed = ObjectRefV1 {
+            context: std::ptr::from_ref(self).cast_mut().cast(),
+            api: &WIRE_OBJECT,
+            lease: wire_lease(1),
+        };
+        // SAFETY: 夹具提供有效的只读 C 表、上下文和同来源诊断，保持到调用返回。
+        unsafe { Connection::from_borrowed(seed) }.err().unwrap()
+    }
+
+    fn managed(&self) -> Result<Error> {
+        let connection = self.endpoint.connection()?;
+        // SAFETY: 夹具预登记本轮来源的准确表、上下文和本次唯一诊断持有。
+        Ok(
+            unsafe { diagnostic::decode_management(Some(&connection), self.outcome()) }
+                .unwrap_err(),
+        )
+    }
+
+    fn outcome(&self) -> OutcomeV1 {
+        let context = std::ptr::from_ref(self).cast_mut().cast();
+        let lease = wire_lease(2);
+        self.endpoint.registry.lock().holds.push((
+            CallTargetV1 {
+                context,
+                api: std::ptr::from_ref(&WIRE_DIAGNOSTIC).cast(),
+                lease: copy_lease(&lease),
+                kind: TARGET_DIAGNOSTIC,
+            },
+            false,
+        ));
+        OutcomeV1 {
+            kind: self.operation_kind,
+            diagnostic_failure_kind: 0,
+            diagnostic: DiagnosticRefV1 {
+                context,
+                api: &WIRE_DIAGNOSTIC,
+                lease,
+            },
+        }
+    }
+}
+
+fn wire_lease(slot: u64) -> LeaseV1 {
+    LeaseV1 {
+        object: ObjectKeyV1 {
+            source: SOURCE_ID,
+            slot,
+            generation: 1,
+        },
+        initialization: init_id(),
+        holding: slot,
+    }
+}
+
+static WIRE_OBJECT: SourceApiV1 = SourceApiV1 {
+    header: ApiHeaderV1 {
+        major: 1,
+        size: size_of::<SourceApiV1>() as u32,
+    },
+    validate: Some(wire_validate),
+    retain: Some(wire_retain),
+    release: Some(wire_release_object),
+    query_interface: Some(wire_query),
+};
+
+static WIRE_DIAGNOSTIC: DiagnosticApiV1 = DiagnosticApiV1 {
+    header: ApiHeaderV1 {
+        major: 1,
+        size: size_of::<DiagnosticApiV1>() as u32,
+    },
+    info: Some(wire_info),
+    copy: Some(wire_copy),
+    release: Some(wire_release_diagnostic),
+};
+
+unsafe extern "C" fn wire_validate(
+    _: *mut c_void,
+    _: LeaseV1,
+    _: InterfaceRequestV1,
+    _: u64,
+) -> OutcomeV1 {
+    diagnostic::limited_outcome(ErrorKind::Unsupported, ErrorKind::InvalidState)
+}
+
+unsafe extern "C" fn wire_retain(
+    _: *mut c_void,
+    _: LeaseV1,
+    _: OperationIdV1,
+    _: *mut ObjectRefV1,
+) -> OutcomeV1 {
+    diagnostic::limited_outcome(ErrorKind::Unsupported, ErrorKind::InvalidState)
+}
+
+unsafe extern "C" fn wire_release_object(
+    _: *mut c_void,
+    _: LeaseV1,
+    _: OperationIdV1,
+) -> OutcomeV1 {
+    diagnostic::limited_outcome(ErrorKind::Unsupported, ErrorKind::InvalidState)
+}
+
+unsafe extern "C" fn wire_query(
+    context: *mut c_void,
+    _: LeaseV1,
+    _: InterfaceRequestV1,
+    _: *mut InterfaceViewV1,
+) -> OutcomeV1 {
+    // SAFETY: 引导（bootstrap）调用者在借用存续期提供实际 DiagnosticWire。
+    unsafe { &*context.cast::<DiagnosticWire>() }.outcome()
+}
+
+unsafe extern "C" fn wire_info(
+    context: *mut c_void,
+    _: LeaseV1,
+    out: *mut DiagnosticInfoV1,
+) -> u32 {
+    // SAFETY: 本次调用受来源保活保护，输出槽（output slot）由调用者独占。
+    let source = unsafe { &*context.cast::<DiagnosticWire>() };
+    source.info_calls.fetch_add(1, Ordering::Relaxed);
+    if source.info_status != 0 {
+        return source.info_status;
+    }
+    unsafe {
+        out.write(DiagnosticInfoV1 {
+            kind: source.reported_kind,
+            user_len: 0,
+            verbose_len: 0,
+            debug_len: 0,
+        })
+    };
+    0
+}
+
+unsafe extern "C" fn wire_copy(
+    context: *mut c_void,
+    _: LeaseV1,
+    _: *mut u8,
+    _: u64,
+    written: *mut u64,
+) -> u32 {
+    // SAFETY: 本次调用受来源保活保护，诊断内容为空且写入计数输出槽有效。
+    let source = unsafe { &*context.cast::<DiagnosticWire>() };
+    source.copy_calls.fetch_add(1, Ordering::Relaxed);
+    unsafe { written.write(0) };
+    0
+}
+
+unsafe extern "C" fn wire_release_diagnostic(context: *mut c_void, lease: LeaseV1) -> u32 {
+    // SAFETY: 引导保护或宿主已登记的归还（registered release）覆盖同一来源。
+    let source = unsafe { &*context.cast::<DiagnosticWire>() };
+    let target = CallTargetV1 {
+        context,
+        api: std::ptr::from_ref(&WIRE_DIAGNOSTIC).cast(),
+        lease,
+        kind: TARGET_DIAGNOSTIC,
+    };
+    source.release_calls.fetch_add(1, Ordering::Relaxed);
+    let mut state = source.endpoint.registry.lock();
+    for (entry, pending) in &mut state.holds {
+        if same_target(entry, &target) {
+            *pending = true;
+            // 先提交既有宿主责任，只有首次归还改变诊断持有状态。
+            if source.released.load(Ordering::Relaxed) == 0 {
+                source.released.fetch_add(1, Ordering::Relaxed);
+            }
+            return 0;
+        }
+    }
+    diagnostic::status_code(ErrorKind::NotFound)
 }

@@ -1,6 +1,6 @@
 // 本地实现入口（local implementation entry）；关键类型由父模块声明。
 use super::*;
-use crate::boundary::{self, Context};
+use crate::boundary::{self, Context, DiagnosticKindMismatch};
 use pi_ffi_abi::{CallTargetV1, InitIdV1, LeaseV1, ObjectKeyV1, TARGET_DIAGNOSTIC};
 
 pub(super) fn copied_diagnostic(error: &Error) -> Option<&CopiedDiagnostic> {
@@ -36,6 +36,7 @@ pub(super) fn snapshot(error: &Error) -> core::result::Result<Snapshot, Snapshot
 pub(super) fn copy_and_release(
     connection: &Connection,
     diagnostic: DiagnosticRefV1,
+    expected_kind: u32,
 ) -> Result<CopiedDiagnostic> {
     let entered = connection
         .next_operation()
@@ -50,7 +51,7 @@ pub(super) fn copy_and_release(
             };
             // SAFETY: 本次来源调用（source call）已实际获准，调用保活尚未归还。
             let copied = boundary::catch(context, || unsafe {
-                boundary::read_diagnostic(&diagnostic)
+                boundary::read_diagnostic(&diagnostic, expected_kind)
             });
             (copied, Some(call))
         }
@@ -102,20 +103,12 @@ pub(super) fn decode(connection: &Connection, outcome: OutcomeV1) -> Result<()> 
         && initialization.module_epoch == lease.initialization.module_epoch
         && initialization.round == lease.initialization.round
     {
-        let copied = super::copy_and_release(connection, diagnostic);
-        let error = match copied {
-            Ok(value) if value.raw_kind == kind => value.into_error(),
-            Ok(value) => inconsistent_kind(value.into_error(), kind),
-            Err(failure) => {
-                if let Some(value) = super::copied_diagnostic(&failure) {
-                    if value.raw_kind != kind {
-                        return Err(inconsistent_kind(failure, kind));
-                    }
-                }
-                failure
-                    .change_context(boundary::decode_kind(kind))
-                    .attach(kind)
-            }
+        let error = match super::copy_and_release(connection, diagnostic, kind) {
+            Ok(value) => value.into_error(),
+            Err(failure) if failure.downcast_ref::<DiagnosticKindMismatch>().is_some() => failure,
+            Err(failure) => failure
+                .change_context(boundary::decode_kind(kind))
+                .attach(kind),
         };
         Err(error)
     } else {
@@ -189,12 +182,6 @@ pub(super) unsafe fn decode_management(
             &outcome.diagnostic,
         ),
     }
-}
-
-fn inconsistent_kind(error: Error, kind: u32) -> Error {
-    error.change_context(ErrorKind::Corrupted).attach(format!(
-        "外层操作分类（operation kind）{kind}与来源诊断分类（diagnostic kind）不符"
-    ))
 }
 
 fn decode_without_source(

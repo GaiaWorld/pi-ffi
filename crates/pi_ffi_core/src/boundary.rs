@@ -119,15 +119,34 @@ pub(crate) fn decode_kind(code: u32) -> ErrorKind {
     inner::decode_kind(code)
 }
 
+// 诊断表实际报告类别与本次结果原类别不符。作为 pi_result 诊断的附加数据，
+// 区分协议矛盾与一次合法诊断的读取或释放失败。报告可打印两个原始类别。
+// @trace 14
+#[derive(Debug)]
+pub(crate) struct DiagnosticKindMismatch {
+    pub(crate) expected: u32,
+    pub(crate) reported: u32,
+}
+
+impl core::fmt::Display for DiagnosticKindMismatch {
+    // @trace 15
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        inner::diagnostic_kind_mismatch_fmt(self, f)
+    }
+}
+
 /// 读取已受外层代码与来源持有保护的不可变诊断；本函数不接管归还责任。
 ///
 /// # Safety
 /// diagnostic的上下文、表和独立持有在整个调用中有效；调用方仍负责唯一归还。
 /// 表和对象访问必须已由管理调用或合法引导外层保护，不能仅以非空地址证明。
-// 本地步骤（local steps）：只借用已保护诊断；核公共分类、三段长度及总和范围，完整精确复制并校验UTF-8；不结束传入持有，归还由调用方负责。
+// 本地步骤（local steps）：只借用已保护诊断；先比对结果的原 C 分类与诊断分类，再核三段长度、总和范围及完整精确复制并校验UTF-8；不结束传入持有，归还由调用方负责。
 // @trace 12
-pub(crate) unsafe fn read_diagnostic(diagnostic: &DiagnosticRefV1) -> Result<CopiedDiagnostic> {
-    unsafe { inner::read_diagnostic(diagnostic) }
+pub(crate) unsafe fn read_diagnostic(
+    diagnostic: &DiagnosticRefV1,
+    expected_kind: u32,
+) -> Result<CopiedDiagnostic> {
+    unsafe { inner::read_diagnostic(diagnostic, expected_kind) }
 }
 
 /// 首次管理查询及输入retain的诊断交接；不依赖尚未建立的Connection。
@@ -136,8 +155,10 @@ pub(crate) unsafe fn read_diagnostic(diagnostic: &DiagnosticRefV1) -> Result<Cop
 /// 外层保护覆盖seed来源上下文及其自身诊断表，持续到本函数返回。
 /// outcome唯一移交，且标准来源的错误诊断由该来源自身创建；不同来源返回拒绝读取。
 /// 来源诊断release必须先把该诊断的既有释放记录提交给来源已持有的宿主连接。
-// 本地步骤（local steps）：先核Outcome及诊断必须同seed来源、上下文和轮次；在本地catch内读取复制；无论复制成功或可捕获恐慌均在保护仍有效时显式调用来源diagnostic.release，其内部先提交既有宿主记录；之后形成本地pi_result，不依赖上层模块或在Drop中执行来源回调。
+// 先核 Outcome 合法分支和诊断的来源、上下文及轮次（round）。仅在合法独立失败
+// 分支传入其非零类别，在原有保护内调用固定读取入口。保护结束前显式归还；保留类别
+// 矛盾的 Corrupted，其它读取或归还失败依原错误报告方式处理。
 // @trace 13
 pub(crate) unsafe fn decode_bootstrap(seed: &ObjectRefV1, outcome: OutcomeV1) -> Result<()> {
-    unsafe { inner::decode_bootstrap(seed, outcome) }
+    unsafe { inner::decode_bootstrap(seed, outcome, read_diagnostic) }
 }

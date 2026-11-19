@@ -74,15 +74,17 @@ pub fn copied_diagnostic(error: &Error) -> Option<&CopiedDiagnostic> {
 pub(crate) fn snapshot(error: &Error) -> core::result::Result<Snapshot, SnapshotFailure> {
     inner::snapshot(error)
 }
-// 本地步骤（local steps）：先保有一次独立诊断责任；在Connection调用保护内借用boundary::read_diagnostic复制；成功或失败都经有限状态submit_release交宿主，次级失败只在此可分配路径形成pi_result。
+// 本地步骤（local steps）：先保有一次独立诊断责任；在Connection调用保护内以原 Outcome 分类调用 boundary::read_diagnostic，先核类别再复制；成功或失败都经有限状态submit_release交宿主，次级失败只在此可分配路径形成pi_result。
 // @trace 11
 pub(crate) fn copy_and_release(
     connection: &Connection,
     diagnostic: DiagnosticRefV1,
+    expected_kind: u32,
 ) -> Result<CopiedDiagnostic> {
-    inner::copy_and_release(connection, diagnostic)
+    inner::copy_and_release(connection, diagnostic, expected_kind)
 }
-// 本地步骤（local steps）：检查Outcome合法分支及分类一致性；有效失败保留原分类并附次级读取或释放失败；矛盾表示归Corrupted且保留原始编号事实。
+// 仅将已核合法独立失败的非零 Outcome.kind 转给复制入口。类别矛盾保留
+// Corrupted 及可打印的两原值。普通读取或释放失败作为原操作错误的次级诊断。
 // @trace 12
 pub(crate) fn decode(connection: &Connection, outcome: OutcomeV1) -> Result<()> {
     inner::decode(connection, outcome)

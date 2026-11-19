@@ -138,7 +138,21 @@ pub(super) fn decode_kind(code: u32) -> ErrorKind {
     }
 }
 
-pub(super) unsafe fn read_diagnostic(diagnostic: &DiagnosticRefV1) -> Result<CopiedDiagnostic> {
+pub(super) fn diagnostic_kind_mismatch_fmt(
+    receiver: &DiagnosticKindMismatch,
+    f: &mut core::fmt::Formatter<'_>,
+) -> core::fmt::Result {
+    write!(
+        f,
+        "外层操作分类（operation kind）{}与来源诊断分类（diagnostic kind）{}不符",
+        receiver.expected, receiver.reported
+    )
+}
+
+pub(super) unsafe fn read_diagnostic(
+    diagnostic: &DiagnosticRefV1,
+    expected_kind: u32,
+) -> Result<CopiedDiagnostic> {
     // SAFETY: 调用方持有来源的代码及上下文（context），只读表（read-only table）全程有效。
     let (info, copy, _) = unsafe { diagnostic_entries(diagnostic.api)? };
     let mut lengths = DiagnosticInfoV1 {
@@ -156,8 +170,12 @@ pub(super) unsafe fn read_diagnostic(diagnostic: &DiagnosticRefV1) -> Result<Cop
         )
     };
     check_status(status, "diagnostic.info")?;
-    if lengths.kind == 0 {
-        return Err(Error::new(ErrorKind::Corrupted).attach("诊断分类（diagnostic kind）为零"));
+    if lengths.kind != expected_kind {
+        let mismatch = DiagnosticKindMismatch {
+            expected: expected_kind,
+            reported: lengths.kind,
+        };
+        return Err(Error::new(ErrorKind::Corrupted).attach(mismatch));
     }
 
     let total = lengths
@@ -244,7 +262,11 @@ unsafe fn diagnostic_entries(
     }
 }
 
-pub(super) unsafe fn decode_bootstrap(seed: &ObjectRefV1, outcome: OutcomeV1) -> Result<()> {
+pub(super) unsafe fn decode_bootstrap(
+    seed: &ObjectRefV1,
+    outcome: OutcomeV1,
+    read: unsafe fn(&DiagnosticRefV1, u32) -> Result<CopiedDiagnostic>,
+) -> Result<()> {
     let OutcomeV1 {
         kind,
         diagnostic_failure_kind,
@@ -293,7 +315,7 @@ pub(super) unsafe fn decode_bootstrap(seed: &ObjectRefV1, outcome: OutcomeV1) ->
         source: lease.object.source,
     };
     // SAFETY: 该保护持续到显式归还（release）之后。
-    let copied = catch(context, || unsafe { read_diagnostic(&diagnostic) });
+    let copied = catch(context, || unsafe { read(&diagnostic, kind) });
     let released = check_status(
         // SAFETY: 此处唯一接管本次独立诊断持有（diagnostic holding），来源仍在外层保护内。
         unsafe { release(diagnostic.context, copy_lease(lease)) },
@@ -301,13 +323,8 @@ pub(super) unsafe fn decode_bootstrap(seed: &ObjectRefV1, outcome: OutcomeV1) ->
     );
 
     let error = match copied {
-        Ok(copied) if copied.raw_kind == kind => copied.into_error(),
-        Ok(copied) => copied
-            .into_error()
-            .change_context(ErrorKind::Corrupted)
-            .attach(format!(
-                "外层操作分类（operation kind）{kind}与来源诊断分类（diagnostic kind）不符"
-            )),
+        Ok(copied) => copied.into_error(),
+        Err(error) if error.downcast_ref::<DiagnosticKindMismatch>().is_some() => error,
         Err(error) => error
             .change_context(decode_kind(kind))
             .attach(format!("引导（bootstrap）操作分类（operation kind）{kind}")),
