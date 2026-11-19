@@ -1,7 +1,16 @@
 use super::*;
-use crate::{authority::LoadAdmission, loader};
-use pi_ffi_abi::management::MetadataV1;
-use pi_ffi_core::{boundary, diagnostic};
+use crate::{
+    authority::{FfiProgress, LoadAdmission, Operation, PreparedInputs, RoundAdmission, RoundCall},
+    loader,
+};
+use pi_ffi_abi::{
+    management::{MetadataV1, INIT_COMPLETED, INIT_NEEDS_CLOSE, INIT_NOT_STARTED},
+    ObjectRefV1,
+};
+use pi_ffi_adapters::{
+    config::PublishedConfig, runtime::PublishedRuntime, service::PublishedTerminal,
+};
+use pi_ffi_core::{boundary, control::Connection, diagnostic};
 use pi_result::{attachment::Operation as ErrorOperation, Error, ErrorKind};
 use std::mem::MaybeUninit;
 
@@ -136,7 +145,7 @@ fn check_metadata(
 }
 
 pub(super) fn manager_maintain(manager: &Manager, budget: usize) -> Result<usize> {
-    todo!("在现有责任内取有界工作，锁外调用来源或执行已知尚未进行的系统释放。未知结果保留；不驱动插件或整个运行时。")
+    manager.authority.maintain(None, budget)
 }
 
 pub(super) fn plugin_metadata(plugin: &Plugin) -> &Metadata {
@@ -153,7 +162,11 @@ where
     T: Send + Sync + 'static,
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
 {
-    todo!("把本轮实际有无运行时交给 Authority::reserve_round。取得已核配套、已登记本轮的连接后，按 B2—B4 装包，每项只登记一次。登记后的失败进入明确的宿主归还路径。")
+    prepare_plugin(plugin, terminal, config, runtime.is_some(), |connection| {
+        runtime
+            .map(|runtime| PublishedRuntime::publish(connection, runtime))
+            .transpose()
+    })
 }
 
 pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static>(
@@ -161,11 +174,63 @@ pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static>(
     terminal: TerminalInput<T>,
     config: Config,
 ) -> Result<Initialization> {
-    todo!("沿同一轮次准备逻辑，将无运行时传给 Authority::reserve_round。获得连接后只登记配置和终端。")
+    prepare_plugin(plugin, terminal, config, false, |_| Ok(None))
+}
+
+fn prepare_plugin<T: Send + Sync + 'static>(
+    plugin: &Plugin,
+    terminal: TerminalInput<T>,
+    config: Config,
+    has_runtime: bool,
+    publish_runtime: impl FnOnce(Connection) -> Result<Option<PublishedRuntime>>,
+) -> Result<Initialization> {
+    let authority = plugin.authority;
+    let (id, connection) = authority.reserve_round(plugin.epoch, has_runtime)?;
+    let prepared = boundary::catch(
+        boundary::Context {
+            operation: "publish plugin initialization inputs",
+            module_epoch: id.module_epoch,
+            round: id.round,
+            source: 0,
+        },
+        || {
+            // 安全前提（safety）。同轮连接及实际配套已核对，原生输入由其配套代码持有。
+            let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
+            let terminal =
+                unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
+            let runtime = publish_runtime(connection)?;
+            authority.publish_inputs(
+                InitIdV1 {
+                    module_epoch: id.module_epoch,
+                    round: id.round,
+                },
+                PreparedInputs {
+                    config,
+                    terminal,
+                    runtime,
+                },
+            )
+        },
+    );
+    match prepared {
+        Ok(()) => Ok(Initialization {
+            authority,
+            epoch: id.module_epoch,
+            round: id.round,
+        }),
+        Err(failure) => Err(authority.fail_prepare(id, failure)),
+    }
 }
 
 pub(super) fn plugin_current_initialization(plugin: &Plugin) -> Result<Option<Initialization>> {
-    todo!("核本模块代际，只返回当前本地管理入口，不查询插件的业务数据。")
+    let authority = plugin.authority;
+    authority.current_round(plugin.epoch).map(|current| {
+        current.map(|id| Initialization {
+            authority,
+            epoch: id.module_epoch,
+            round: id.round,
+        })
+    })
 }
 
 pub(super) fn plugin_unload(plugin: &Plugin) -> Result<()> {
@@ -183,9 +248,160 @@ pub(super) fn initialization_id(initialization: &Initialization) -> InitIdV1 {
 }
 
 pub(super) fn initialization_run(initialization: &Initialization) -> Result<()> {
-    todo!("取得同一轮次调用资格，核实实际依赖，用配置外层保护及终端、可选运行时借用同步调用。先记效果先由 Authority 核本模块诊断登记，再处理 B1 诊断，最后归还实际保护。")
+    let authority = initialization.authority;
+    let id = initialization.id();
+    match authority.begin_round(id, Operation::Initialize)? {
+        RoundAdmission::Replay { error } => replay_round(error),
+        RoundAdmission::ReturnHoldings => Err(Error::new(ErrorKind::InvalidState)
+            .attach(ErrorOperation("initialize returning plugin inputs"))),
+        RoundAdmission::Call(call) => {
+            let result = boundary::catch(
+                initialization_context(initialization, "initialize plugin"),
+                || initialize_with_inputs(authority, &call),
+            );
+            authority.finish_round(call, result)
+        }
+    }
 }
 
 pub(super) fn initialization_close(initialization: &Initialization) -> Result<()> {
-    todo!("不等待在途调用。插件明确完成后保存回执，在本模块持有内校验并接管诊断，再推进 B1 归还。已成功部分不重跑，旧轮只回放原结果。")
+    let authority = initialization.authority;
+    let id = initialization.id();
+    match authority.begin_round(id, Operation::Close)? {
+        RoundAdmission::Replay { error } => replay_round(error),
+        RoundAdmission::ReturnHoldings => finish_returning_inputs(initialization),
+        RoundAdmission::Call(call) => {
+            let mut completed = false;
+            let result = boundary::catch(
+                initialization_context(initialization, "close plugin"),
+                || {
+                    authority.remember_progress(&call, FfiProgress::OutcomeUnknown);
+                    // 安全前提（safety）。本次独占标准调用保活同一实际模块，编号为本轮。
+                    let outcome = unsafe { (call.entries.close)(initialization.id()) };
+                    completed = valid_close_success(&outcome);
+                    if completed {
+                        authority.remember_progress(&call, FfiProgress::CloseCompleted);
+                    } else if outcome.kind == diagnostic::status_code(ErrorKind::Busy) {
+                        authority.remember_progress(&call, FfiProgress::ClosePending);
+                    }
+                    authority.validate_diagnostic(&call, &outcome)?;
+                    // 安全前提（safety）。本模块、此轮已登记来源及独立诊断均仍有实际保护。
+                    unsafe { diagnostic::decode_management(Some(&call.connection), outcome) }
+                },
+            );
+            let finished = authority.finish_round(call, result);
+            if completed && finished.is_ok() {
+                finish_returning_inputs(initialization)
+            } else {
+                finished
+            }
+        }
+    }
+}
+
+fn initialization_context(
+    initialization: &Initialization,
+    operation: &'static str,
+) -> boundary::Context {
+    boundary::Context {
+        operation,
+        module_epoch: initialization.epoch,
+        round: initialization.round,
+        source: 0,
+    }
+}
+
+fn replay_round(error: Option<Arc<Error>>) -> Result<()> {
+    match error {
+        None => Ok(()),
+        Some(error) => {
+            let nested = error
+                .downcast_ref::<Arc<diagnostic::CopiedDiagnostic>>()
+                .map(Arc::clone);
+            let report = Error::new(*error.current_context())
+                .attach(ErrorOperation("replay plugin initialization round"))
+                .attach(pi_result::debug_message(&error));
+            Err(match nested {
+                Some(nested) => report.attach(nested),
+                None => report,
+            })
+        }
+    }
+}
+
+fn initialize_with_inputs(authority: &Authority, call: &RoundCall) -> Result<()> {
+    let inputs = call
+        .inputs
+        .as_ref()
+        .ok_or_else(|| Error::new(ErrorKind::Corrupted))?;
+    loader::check_inputs(&call.image, inputs.runtime.is_some())?;
+    inputs.config.with_input(|config| {
+        inputs
+            .terminal
+            .with_input(|terminal| match &inputs.runtime {
+                Some(runtime) => runtime.with_input(|runtime| {
+                    invoke_initialization(
+                        authority,
+                        call,
+                        std::ptr::from_ref(runtime),
+                        terminal,
+                        config,
+                    )
+                }),
+                None => invoke_initialization(authority, call, std::ptr::null(), terminal, config),
+            })
+    })
+}
+
+fn invoke_initialization(
+    authority: &Authority,
+    call: &RoundCall,
+    runtime: *const ObjectRefV1,
+    terminal: &ObjectRefV1,
+    config: &ObjectRefV1,
+) -> Result<()> {
+    authority.remember_progress(call, FfiProgress::OutcomeUnknown);
+    // 安全前提（safety）。标准调用资格保活实际模块，所有原生输入处在嵌套同步借用中。
+    let reply = unsafe { (call.entries.initialize)(runtime, terminal, config) };
+    let progress = match reply.progress {
+        INIT_COMPLETED => FfiProgress::InitializationCompleted,
+        INIT_NOT_STARTED if reply.outcome.kind != 0 => FfiProgress::InitializationNotStarted,
+        INIT_NEEDS_CLOSE if reply.outcome.kind != 0 => FfiProgress::InitializationNeedsClose,
+        _ => {
+            return Err(Error::new(ErrorKind::Corrupted)
+                .attach(ErrorOperation("read initialization progress"))
+                .attach(reply.progress))
+        }
+    };
+    authority.remember_progress(call, progress);
+    authority.validate_diagnostic(call, &reply.outcome)?;
+    // 安全前提（safety）。独立诊断已经核对本模块、来源和本轮持有，所有借用仍有效。
+    unsafe { diagnostic::decode_management(Some(&call.connection), reply.outcome) }
+}
+
+fn valid_close_success(outcome: &pi_ffi_abi::OutcomeV1) -> bool {
+    let diagnostic = &outcome.diagnostic;
+    let lease = &diagnostic.lease;
+    outcome.kind == 0
+        && outcome.diagnostic_failure_kind == 0
+        && diagnostic.context.is_null()
+        && diagnostic.api.is_null()
+        && lease.object.source == 0
+        && lease.object.slot == 0
+        && lease.object.generation == 0
+        && lease.initialization.module_epoch == 0
+        && lease.initialization.round == 0
+        && lease.holding == 0
+}
+
+fn finish_returning_inputs(initialization: &Initialization) -> Result<()> {
+    let authority = initialization.authority;
+    authority.maintain(Some(initialization.id()), 64)?;
+    match authority.begin_round(initialization.id(), Operation::Close)? {
+        RoundAdmission::Replay { error } => replay_round(error),
+        RoundAdmission::ReturnHoldings => Err(Error::new(ErrorKind::Busy)
+            .attach(ErrorOperation("return plugin initialization inputs"))),
+        RoundAdmission::Call(_) => Err(Error::new(ErrorKind::Corrupted)
+            .attach(ErrorOperation("repeat completed plugin close"))),
+    }
 }
