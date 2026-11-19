@@ -498,6 +498,76 @@ fn test_registry_diagnostic_can_outlive_source() -> Result<()> {
     Ok(())
 }
 
+/// 来源发布（source publication）以最终关闭分类交给宿主，本地维护（maintenance）仍能读到实际清理错误、原分类和三段诊断。
+#[test]
+fn test_publish_management_failure_retains_cleanup_report() -> Result<()> {
+    let cases = [
+        (ErrorKind::Busy, ErrorKind::Io, ErrorKind::Internal),
+        (
+            ErrorKind::Dependency,
+            ErrorKind::ResourceExhausted,
+            ErrorKind::Dependency,
+        ),
+    ];
+    for (original_kind, cleanup_kind, published_kind) in cases {
+        let endpoint = Arc::new(Endpoint::default());
+        let connection = endpoint.connection()?;
+        let registry = Registry::attach(connection.clone())?;
+        let original = Error::new(original_kind).attach("original local close detail");
+        let original_user = pi_result::user_message(&original);
+        let original_verbose = pi_result::verbose_message(&original);
+        let original_debug = pi_result::debug_message(&original);
+        let actual_cleanup = Error::new(cleanup_kind).attach("actual local disposal detail");
+        let (failure, unconfirmed) = diagnostic::ManagementFailure::capture(&original)
+            .finish_report_cleanup(Some((cleanup_kind, pi_result::debug_message(&actual_cleanup))));
+        assert!(unconfirmed);
+
+        let outcome = registry.publish_management_failure(&failure);
+        assert_eq!(outcome.kind, diagnostic::status_code(published_kind));
+        assert_eq!(outcome.diagnostic_failure_kind, 0);
+        // SAFETY: 本次诊断（diagnostic）来自同一登记来源且独立持有仍有效，由宿主接管一次。
+        let published =
+            unsafe { diagnostic::decode_management(Some(&connection), outcome) }.unwrap_err();
+        assert_eq!(published.current_context(), &published_kind);
+        let published = diagnostic::copied_diagnostic(&published).unwrap();
+        assert_eq!(published.kind, published_kind);
+        assert_eq!(published.raw_kind, diagnostic::status_code(published_kind));
+        assert_eq!(published.user, original_user);
+        assert!(published.verbose.starts_with(&original_verbose));
+        assert!(published.debug.starts_with(&original_debug));
+        assert!(published.debug.contains("actual local disposal detail"));
+
+        assert_eq!(endpoint.drain_requested(), 1);
+        for _ in 0..2 {
+            let local = registry.maintain().unwrap_err();
+            assert_eq!(local.current_context(), &cleanup_kind);
+            let original = local
+                .downcast_ref::<Error>()
+                .expect("保留原操作分类（original operation kind）");
+            assert_eq!(original.current_context(), &original_kind);
+            let report = local
+                .downcast_ref::<Arc<Error>>()
+                .expect("保留本地诊断（local diagnostic）");
+            let retained = diagnostic::copied_diagnostic(report).unwrap();
+            assert_eq!(retained.kind, published.kind);
+            assert_eq!(retained.user, published.user);
+            assert_eq!(retained.verbose, published.verbose);
+            assert_eq!(retained.debug, published.debug);
+        }
+        assert_eq!(endpoint.drain_requested(), 0);
+
+        let retired = registry.try_retire().unwrap_err();
+        assert_eq!(retired.current_context(), &cleanup_kind);
+        let diagnostic = diagnostic::copied_diagnostic(&retired).unwrap();
+        assert_eq!(diagnostic.kind, cleanup_kind);
+        assert!(diagnostic.debug.contains("original local close detail"));
+        assert!(diagnostic.debug.contains("actual local disposal detail"));
+        assert_eq!(endpoint.drain_requested(), 1);
+        assert!(endpoint.registry.lock().source.is_some());
+    }
+    Ok(())
+}
+
 /// 输入引导（input bootstrap）在实际来源保护内先拒绝矛盾分类，同时归还诊断持有。
 #[test]
 fn test_bootstrap_rejects_mismatched_kind_before_copy() {

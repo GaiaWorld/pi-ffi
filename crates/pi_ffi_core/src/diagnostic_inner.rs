@@ -140,7 +140,70 @@ pub(super) fn management_failure_finish_report_cleanup(
     failure: ManagementFailure,
     disposal: Option<(ErrorKind, String)>,
 ) -> (ManagementFailure, bool) {
-    todo!("消费本地快照及原报告受保护销毁的结果。使用原有清理标记与实际销毁结果。确认可继续时原样保留错误。清理未确认时保留原分类、已取得的三段文本以及实际销毁诊断；原 Busy 归为 Internal。分别存原分类、已知实际清理分类和可取得的材料。来源后续维护或退役使用实际清理分类为主并保留原分类。原诊断不可取得时仅根据原分类和现有诊断材料形成报告。最终快照的报告类别和交付类别一致，标记保留。不再次执行用户报告格式化，不建立来源诊断持有。")
+    if disposal.is_none() {
+        if failure.report_cleanup.is_some() {
+            return (failure, true);
+        }
+        if !failure.cleanup_unconfirmed {
+            return (failure, false);
+        }
+    }
+
+    let mut snapshot = match failure.cached {
+        CachedFailure::Complete(snapshot) => match Arc::try_unwrap(snapshot) {
+            Ok(snapshot) => snapshot,
+            Err(shared) => Snapshot {
+                kind: shared.kind,
+                user: shared.user.clone(),
+                verbose: shared.verbose.clone(),
+                debug: shared.debug.clone(),
+            },
+        },
+        CachedFailure::Unavailable {
+            operation,
+            diagnostic,
+        } => {
+            let capture = format!("原诊断建立分类（original diagnostic capture kind） {diagnostic:?}");
+            Snapshot {
+                kind: operation,
+                user: "报告清理未确认（Report cleanup unconfirmed）".to_owned(),
+                verbose: capture.clone(),
+                debug: capture,
+            }
+        }
+    };
+    let original_kind = failure
+        .report_cleanup
+        .as_ref()
+        .map_or(snapshot.kind, |cleanup| cleanup.original_kind);
+    let cleanup_kind = disposal
+        .as_ref()
+        .map_or(ErrorKind::Internal, |(kind, _)| *kind);
+    if original_kind == ErrorKind::Busy {
+        snapshot.kind = ErrorKind::Internal;
+    }
+
+    let mut details = format!(
+        "\n原操作分类（original operation kind） {original_kind:?}\n实际清理分类（actual cleanup kind） {cleanup_kind:?}"
+    );
+    if let Some((_, disposal)) = disposal {
+        details.push('\n');
+        details.push_str(&disposal);
+    }
+    snapshot.verbose.push_str(&details);
+    snapshot.debug.push_str(&details);
+
+    (
+        ManagementFailure {
+            cached: CachedFailure::Complete(Arc::new(snapshot)),
+            cleanup_unconfirmed: true,
+            report_cleanup: Some(ReportCleanup {
+                original_kind,
+                cleanup_kind,
+            }),
+        },
+        true,
+    )
 }
 
 pub(super) fn management_failure_without_source(failure: &ManagementFailure) -> OutcomeV1 {

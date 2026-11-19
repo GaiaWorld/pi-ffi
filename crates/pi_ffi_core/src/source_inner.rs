@@ -867,10 +867,20 @@ pub(super) fn publish_management_failure(
     registry: &Registry,
     failure: &crate::diagnostic::ManagementFailure,
 ) -> OutcomeV1 {
+    let shared = &registry.shared;
     if failure.cleanup_unconfirmed {
-        retain_unconfirmed_cleanup(&registry.shared, snapshot_kind(&failure.cached), None);
+        let (original_kind, cleanup_kind) = failure.report_cleanup.as_ref().map_or_else(
+            || (snapshot_kind(&failure.cached), ErrorKind::Internal),
+            |cleanup| (cleanup.original_kind, cleanup.cleanup_kind),
+        );
+        let recorded = Failure {
+            kind: cleanup_kind,
+            secondary: Some(original_kind),
+            report: Some(Arc::new(source_error_from_snapshot(&failure.cached))),
+        };
+        retain_cleanup_failure(shared, &recorded);
     }
-    publish_failure(&registry.shared, &failure.cached)
+    publish_failure(shared, &failure.cached)
 }
 
 fn source_outcome(shared: &Shared, result: Result<()>) -> OutcomeV1 {
@@ -941,16 +951,18 @@ fn retain_unconfirmed_cleanup(
         secondary: Some(original),
         report: report.map(Arc::new),
     };
-    {
-        let mut state = shared.state.lock();
-        if !matches!(state.phase, SourcePhase::Retired) {
-            state.phase = SourcePhase::Failed;
-            if state.failure.is_none() {
-                state.failure = Some(copy_recorded_failure(&failure));
-            }
+    retain_cleanup_failure(shared, &failure);
+    failure
+}
+
+fn retain_cleanup_failure(shared: &Shared, failure: &Failure) {
+    let mut state = shared.state.lock();
+    if !matches!(state.phase, SourcePhase::Retired) {
+        state.phase = SourcePhase::Failed;
+        if state.failure.is_none() {
+            state.failure = Some(copy_recorded_failure(failure));
         }
     }
-    failure
 }
 
 fn snapshot_kind(failure: &CachedFailure) -> ErrorKind {
@@ -1565,6 +1577,9 @@ fn copy_recorded_failure(failure: &Failure) -> Failure {
 fn cleanup_error(recorded: Failure) -> Error {
     let mut failure = error(recorded.kind, "source cleanup");
     if let Some(report) = recorded.report {
+        if let Some(snapshot) = diagnostic::copied_diagnostic(&report) {
+            failure = failure.attach(snapshot.to_string());
+        }
         failure = failure.attach(report);
     }
     if let Some(kind) = recorded.secondary {
