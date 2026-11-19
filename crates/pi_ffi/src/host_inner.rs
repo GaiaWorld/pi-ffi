@@ -1,13 +1,15 @@
 use super::*;
+use crate::loader;
+use pi_result::{Error, ErrorKind};
 
 pub(super) unsafe fn terminal_input<T: Send + Sync + 'static>(
     terminal: Arc<T>,
 ) -> TerminalInput<T> {
-    todo!("保存实际 Arc，不改变终端，不接管服务。")
+    TerminalInput { terminal }
 }
 
 pub(super) fn manager_process(build: HostBuild) -> Result<Manager> {
-    todo!("绑定宿主的一份 Authority；插件接入不初始化一个独立的宿主。")
+    Authority::process(build).map(|authority| Manager { authority })
 }
 
 pub(super) fn manager_find(
@@ -15,7 +17,38 @@ pub(super) fn manager_find(
     packages: &[PluginPackage],
     request: &PluginRequest,
 ) -> Result<PluginPackage> {
-    todo!("按 UUID 和 VersionReq 匹配记录，使用 cmp_precedence。核不同文件的同优先级，拒绝歧义。期间不装入。")
+    let _ = manager;
+    let mut matching = packages.iter().filter(|package| {
+        let manifest = package.manifest();
+        manifest.uuid == request.uuid && request.version.matches(&manifest.version)
+    });
+    let best = matching
+        .clone()
+        .max_by(|left, right| {
+            left.manifest()
+                .version
+                .cmp_precedence(&right.manifest().version)
+        })
+        .ok_or_else(|| Error::new(ErrorKind::NotFound).attach(request.version.to_string()))?;
+    let selected_identity = loader::file_identity(best)?;
+    let selected = best.manifest();
+    for package in &mut matching {
+        let manifest = package.manifest();
+        if std::ptr::eq(package, best)
+            || !manifest.version.cmp_precedence(&selected.version).is_eq()
+        {
+            continue;
+        }
+        if loader::file_identity(package)? != selected_identity
+            || manifest.version != selected.version
+            || manifest.library.sha256 != selected.library.sha256
+            || manifest.rust_build_sha256 != selected.rust_build_sha256
+            || manifest.allocator != selected.allocator
+        {
+            return Err(Error::new(ErrorKind::Conflict).attach(selected.version.to_string()));
+        }
+    }
+    Ok(best.clone())
 }
 
 pub(super) fn manager_load(
@@ -31,7 +64,7 @@ pub(super) fn manager_maintain(manager: &Manager, budget: usize) -> Result<usize
 }
 
 pub(super) fn plugin_metadata(plugin: &Plugin) -> &Metadata {
-    todo!("借用已校验的宿主副本，无插件调用和生命周期状态锁。")
+    &plugin.metadata
 }
 
 pub(super) fn plugin_prepare<T, R>(
@@ -64,7 +97,10 @@ pub(super) fn plugin_unload(plugin: &Plugin) -> Result<()> {
 }
 
 pub(super) fn initialization_id(initialization: &Initialization) -> InitIdV1 {
-    todo!("用管理入口的数据重建同一轮次标识。")
+    InitIdV1 {
+        module_epoch: initialization.epoch,
+        round: initialization.round,
+    }
 }
 
 pub(super) fn initialization_run(initialization: &Initialization) -> Result<()> {

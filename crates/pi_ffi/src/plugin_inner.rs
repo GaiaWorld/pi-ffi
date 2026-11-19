@@ -1,4 +1,6 @@
 use super::*;
+use pi_ffi_core::{boundary::Context, diagnostic};
+use pi_result::ErrorKind;
 
 pub(super) const fn exports_new<S: Send + 'static>(declaration: Declaration) -> Exports<S> {
     Exports {
@@ -14,8 +16,37 @@ pub(super) unsafe fn export_metadata<S: Send + 'static>(
     exports: &Exports<S>,
     out: *mut MetadataV1,
 ) -> OutcomeV1 {
-    todo!(
-        "保护整个 C 入口，检查输出槽的可检查前提，写 UUID 和不可变版本文本。无业务锁，无来源持有。"
+    diagnostic::protect_outcome(
+        Context {
+            operation: "plugin metadata",
+            module_epoch: 0,
+            round: 0,
+            source: 0,
+        },
+        || {
+            let declaration = &exports.declaration;
+            if out.is_null()
+                || !out.is_aligned()
+                || declaration.uuid == [0; 16]
+                || semver::Version::parse(declaration.version).is_err()
+            {
+                return diagnostic::limited_outcome(
+                    ErrorKind::InvalidInput,
+                    ErrorKind::InvalidState,
+                );
+            }
+            // SAFETY: 调用方提供完整、独占的输出槽（output slot），版本字节只借自本模块。
+            unsafe {
+                out.write(MetadataV1 {
+                    uuid: pi_ffi_abi::UuidV1 {
+                        bytes: declaration.uuid,
+                    },
+                    version: declaration.version.as_ptr(),
+                    version_len: declaration.version.len() as u64,
+                })
+            };
+            diagnostic::success_outcome()
+        },
     )
 }
 

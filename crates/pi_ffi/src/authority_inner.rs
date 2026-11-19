@@ -1,11 +1,31 @@
 use super::*;
+use pi_result::ErrorKind;
 
 pub(super) fn authority_process(build: HostBuild) -> Result<&'static Authority> {
-    todo!("绑定唯一宿主管理构建。重复确认匹配时引用同一个静态记录。冲突作为 pi_result 报告。")
+    let build = Arc::new(build);
+    let matches = {
+        let mut state = AUTHORITY.state.lock();
+        if let Some(current) = &state.build {
+            **current == *build
+        } else {
+            state.build = Some(Arc::clone(&build));
+            true
+        }
+    };
+    if matches {
+        Ok(&AUTHORITY)
+    } else {
+        Err(Error::new(ErrorKind::Conflict)
+            .attach(pi_result::attachment::Operation("bind process host build")))
+    }
 }
 
 pub(super) fn authority_build(authority: &Authority) -> Result<Arc<HostBuild>> {
-    todo!("借该进程同一配置的自有持有，锁外使用。")
+    let build = authority.state.lock().build.clone();
+    build.ok_or_else(|| {
+        Error::new(ErrorKind::InvalidState)
+            .attach(pi_result::attachment::Operation("read process host build"))
+    })
 }
 
 pub(super) fn authority_reserve_load(
