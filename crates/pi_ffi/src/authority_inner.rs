@@ -3733,6 +3733,8 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
+        /// 为本单元测试（unit test）独占创建临时目录（temporary directory）。
+        /// 编号冲突时继续申请，其它文件系统错误立即使测试失败。
         fn new() -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             loop {
@@ -3749,6 +3751,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
     }
 
     impl Drop for TestDirectory {
+        /// 尝试清理本辅助对象创建的文件，清理失败不覆盖原测试的诊断（diagnostic）。
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
@@ -3760,6 +3763,10 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         BINARY.get_or_init(|| compile_fixture(FIXTURE))
     }
 
+    /// 将本模块提供的可信源码（source code）编译为独立动态库（dynamic library）字节。
+    /// 使用本仓应用二进制接口（ABI）声明，编译及读取失败立即使测试失败。
+    /// 退出本函数时尝试清理临时目录（temporary directory）。
+    /// 该输入只验证管理与元信息（metadata）边界，不承担真实终端（terminal）或数据库验证。
     fn compile_fixture(text: &str) -> Vec<u8> {
         let dir = TestDirectory::new();
         let abi_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi_ffi_abi/src/lib.rs");
@@ -3816,10 +3823,13 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
     }
 
     impl Artifact {
+        /// 为固定元信息（metadata）制品创建独占文件，供装入与退役用例复用。
         fn new() -> Self {
             Self::from_binary(fixture_binary(), VERSION)
         }
 
+        /// 将可信制品字节写入独占目录并计算摘要（digest）。
+        /// `version` 只填写后续批准清单（manifest），不改变库内实际版本，允许核对不匹配。
         fn from_binary(binary: &[u8], version: &'static str) -> Self {
             let dir = TestDirectory::new();
             let path = dir.0.join("fixture.so");
@@ -3832,15 +3842,20 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
             }
         }
 
+        /// 按给定 UUID 生成清单（manifest），走默认包构造入口供接纳或拒绝用例复用。
         fn package(&self, uuid: [u8; 16]) -> PluginPackage {
             self.package_from(self.manifest(uuid))
         }
 
+        /// 按给定清单（manifest）调用默认包构造入口，失败立即使测试失败。
+        /// 此处不执行装入（loading）或实际元信息（metadata）核对。
         fn package_from(&self, manifest: BuildManifest) -> PluginPackage {
             // 安全前提（safety）。本测试编译并保持制品（artifact），仅使用共同元信息边界。
             unsafe { PluginPackage::from_verified_build(self.dir.0.clone(), manifest) }.unwrap()
         }
 
+        /// 仅为本模块无业务、任务及退出回调的元信息（metadata）制品选择提前卸载（unloading）。
+        /// 此资格不推广到真实终端（terminal）或其它插件（plugin）输入。
         fn unloadable(&self) -> PluginPackage {
             // 安全前提（safety）。本制品只读取静态元信息（metadata），无业务、任务或退出回调。
             unsafe {
@@ -3852,6 +3867,8 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
             .unwrap()
         }
 
+        /// 用实际文件摘要（digest）、给定 UUID 和本测试的批准版本构造清单（manifest）。
+        /// 固定宿主构建标识（host build identity）只服务于本组单元测试（unit tests）。
         fn manifest(&self, uuid: [u8; 16]) -> BuildManifest {
             let host = build();
             BuildManifest {
@@ -3869,6 +3886,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
             }
         }
 
+        /// 按独占文件的绝对路径观察当前 Linux 进程映射（process mapping）。
         fn mapped(&self) -> bool {
             // 读取进程映射（process mappings），不增加额外系统引用（system reference）。
             let path = self.path.canonicalize().unwrap();
@@ -3879,6 +3897,8 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         }
     }
 
+    /// 提供本组单元测试（unit tests）的固定宿主构建标识（host build identity）。
+    /// 该标识用于核验分支，不代表真实工具链（toolchain）的兼容证明。
     fn build() -> HostBuild {
         HostBuild {
             rust_build_sha256: [42; 32],
@@ -3886,6 +3906,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         }
     }
 
+    /// 以给定 UUID 和固定版本范围（version requirement）`=1.2.3` 构造装入请求。
     fn request(uuid: [u8; 16]) -> PluginRequest {
         PluginRequest {
             uuid,
@@ -3893,6 +3914,8 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         }
     }
 
+    /// 对已装入的包重新核验实际文件，要求命中活动映像复用（active image reuse）分支。
+    /// 返回已有管理代（management generation），其它接纳结果立即使测试失败。
     fn loaded_epoch(package: &PluginPackage) -> u64 {
         let files = loader::verify_files(package, &build()).unwrap();
         let LoadAdmission::Reuse(view) = AUTHORITY.reserve_load(files).unwrap() else {
@@ -3901,6 +3924,9 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         view.epoch
     }
 
+    /// 核验给定包并取得为新管理代（management generation）准备的 `LoadAdmission::New`。
+    /// 用于局部中断与恢复分支，可能接管已保留的系统引用（system reference）。
+    /// 本调用不执行系统装入（native loading），未取得该分支立即使测试失败。
     fn new_operation(package: &PluginPackage) -> SystemOperation {
         let files = loader::verify_files(package, &build()).unwrap();
         let LoadAdmission::New(operation) = AUTHORITY.reserve_load(files).unwrap() else {
