@@ -1,65 +1,189 @@
 // 本地实现入口（local implementation entry）；关键类型由父模块声明。
 use super::*;
+use crate::{boundary, diagnostic};
+use pi_ffi_abi::{
+    ApiHeaderV1, CallTargetV1, InterfaceViewV1, ObjectKeyV1, SourceApiV1, TARGET_OBJECT,
+};
+use pi_result::{Error, ErrorKind};
 
 pub(super) unsafe fn object_from_transfer(
     connection: Connection,
     raw: ObjectRefV1,
 ) -> Result<Object> {
-    todo!("输入（input）：connection, raw；本地步骤（local steps）：先为已唯一移交的持有建立恢复责任，再核连接及来源；本地包装失败也提交既有释放记录，不泄漏或重复接管；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let owner = ObjectOwner {
+        connection,
+        raw,
+        state: Mutex::new(OwnerState::Live),
+    };
+    // 先由本地拥有者（local owner）承担释放义务（release obligation），任一后续失败都走其析构。
+    let call = enter_owner(&owner, 1)?;
+    call.finish()?;
+    Ok(Object {
+        owner: Arc::new(owner),
+    })
 }
 
 pub(super) fn object_initialization(receiver: &Object) -> InitIdV1 {
-    todo!("输入（input）：self；本地步骤（local steps）：逐字段重建本对象所属初始化标识；不取得新持有，不查询已退役来源；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    copy_round(&receiver.owner.raw.lease.initialization)
 }
 
 pub(super) fn object_with_borrowed<R>(
     receiver: &Object,
     body: impl for<'call> FnOnce(&'call ObjectRefV1) -> Result<R>,
 ) -> Result<R> {
-    todo!("取得现有持有的读取调用保活，在闭包范围内借用C表示，归还调用并保留主错误及归还失败")
+    let call = enter_owner(&receiver.owner, 1)?;
+    let result = body(&receiver.owner.raw);
+    finish(result, call)
 }
 
 pub(super) unsafe fn object_retain_borrowed(
     connection: &Connection,
     input: &ObjectRefV1,
 ) -> Result<Object> {
-    todo!("复核同轮与实际管理连接，在调用保护内取得并唯一接管独立持有，保留诊断和释放责任")
+    // SAFETY: 本调用的外层初始化保护（initialization protection）覆盖该输入和来源诊断表。
+    unsafe { connection.check_peer(copy_raw(input))? };
+    let call = connection.enter(target(input), connection.next_operation()?, 1)?;
+    let retained = connection.next_operation().and_then(|operation| {
+        // SAFETY: 本次调用已登记，且原调用方继续持有输入。
+        let transfer = unsafe { retain(connection, input, operation)? };
+        // SAFETY: retain 成功已唯一接管新的、经过核实的独立持有（independent holding）。
+        unsafe { Object::from_transfer(connection.clone(), transfer.into_raw()) }
+    });
+    finish(retained, call)
 }
 
 pub(super) fn object_try_retain(receiver: &Object) -> Result<Object> {
-    todo!("输入（input）：self；本地步骤（local steps）：保留当前拥有者并取得调用资格；新操作retain后立刻接管返回的独立持有，再做失败加工；当前对象不因失败失效；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let connection = &receiver.owner.connection;
+    let call = enter_owner(&receiver.owner, 1)?;
+    let retained = connection.next_operation().and_then(|operation| {
+        // SAFETY: 活动来源调用（source call）及原拥有者保护基础操作表。
+        let transfer = unsafe { retain(connection, &receiver.owner.raw, operation)? };
+        // SAFETY: 移交包装（transfer wrapper）只交出这一份独立持有。
+        unsafe { Object::from_transfer(connection.clone(), transfer.into_raw()) }
+    });
+    finish(retained, call)
 }
 
 pub(super) fn object_retain_for_transfer(receiver: &Object) -> Result<TransferObject> {
-    todo!("输入（input）：self；本地步骤（local steps）：按新独立retain取得一次可移交持有并建立不可Clone包装；未交出前任何失败都提交该持有；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let connection = &receiver.owner.connection;
+    let call = enter_owner(&receiver.owner, 1)?;
+    let retained = connection.next_operation().and_then(|operation| {
+        // SAFETY: 来源操作表由本次调用保活（call protection）及原拥有者共同保护。
+        unsafe { retain(connection, &receiver.owner.raw, operation) }
+    });
+    finish(retained, call)
 }
 
 pub(super) fn object_release(receiver: Object) -> Result<()> {
-    todo!("输入（input）：self；本地步骤（local steps）：以Arc::try_unwrap区分最后本地拥有者；有别名时仅结束当前别名；最后拥有者经ObjectOwner::submit_release提交，显式失败在返回前另建本地pi_result；Drop不重复提交；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let Ok(owner) = Arc::try_unwrap(receiver.owner) else {
+        return Ok(());
+    };
+    let status = owner.submit_release();
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(operation_error(boundary::decode_kind(status), "object release").attach(status))
+    }
 }
 
 pub(super) fn object_interface<I: AbiInterface>(receiver: &Object) -> Result<Interface<I>> {
-    todo!("输入（input）：self；本地步骤（local steps）：在本次代码保护内执行query；核固定身份、主版本、准确尺寸、权限及非空地址；保存实际返回context并共享本地拥有者；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let size = u32::try_from(size_of::<I::Table>())
+        .map_err(|_| operation_error(ErrorKind::InvalidInput, "interface size"))?;
+    if I::ID.bytes == [0; 16]
+        || I::MAJOR == 0
+        || (size as usize) < size_of::<ApiHeaderV1>()
+        || I::SUPPORTED_RIGHTS & !7 != 0
+    {
+        return Err(operation_error(
+            ErrorKind::InvalidInput,
+            "interface declaration",
+        ));
+    }
+    let call = enter_owner(&receiver.owner, 1)?;
+    let result = (|| {
+        let raw = &receiver.owner.raw;
+        // SAFETY: 当前来源表（source table）已由宿主活动调用保护。
+        let api = unsafe { source_table(raw)? };
+        let query = api
+            .query_interface
+            .ok_or_else(|| operation_error(ErrorKind::Corrupted, "query interface"))?;
+        let request = InterfaceRequestV1 {
+            interface_id: I::ID,
+            major: I::MAJOR,
+            size,
+        };
+        let mut view = InterfaceViewV1 {
+            context: std::ptr::null_mut(),
+            table: std::ptr::null(),
+        };
+        // SAFETY: 持有仍有效。输出槽（output slot）由调用方独占，仅成功时读取。
+        let outcome = unsafe { query(raw.context, copy_lease(&raw.lease), request, &mut view) };
+        decode_source(&receiver.owner.connection, raw, outcome)?;
+        let pointer = view.table.cast::<I::Table>();
+        if view.context.is_null() || pointer.is_null() || !pointer.is_aligned() {
+            return Err(operation_error(
+                ErrorKind::Corrupted,
+                "queried interface address",
+            ));
+        }
+        // SAFETY: 来源成功返回固定首部（API header），整个借用在当前保护内。
+        let header = unsafe { &*pointer.cast::<ApiHeaderV1>() };
+        if header.major != I::MAJOR || header.size != size {
+            return Err(operation_error(
+                ErrorKind::Corrupted,
+                "queried interface header",
+            ));
+        }
+
+        Ok(Interface {
+            object: receiver.clone(),
+            address: TableAddress {
+                context: view.context,
+                pointer,
+                marker: PhantomData,
+            },
+        })
+    })();
+    finish(result, call)
 }
 
 pub(super) fn object_clone(receiver: &Object) -> Object {
-    todo!("输入（input）：self；本地步骤（local steps）：只克隆本地共享拥有者，不跨C创建独立持有，不改变来源计数；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    Object {
+        owner: Arc::clone(&receiver.owner),
+    }
 }
 
 pub(super) fn object_owner_submit_release(receiver: &ObjectOwner) -> u32 {
-    todo!("输入（input）：self；本地步骤（local steps）：锁内核唯一提交状态并领取提交资格；锁外调用Connection::submit_release的有限状态出口，保存已提交或隔离状态；不创建Report或临时释放记录；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    {
+        let mut state = receiver.state.lock();
+        match *state {
+            OwnerState::ReleaseSubmitted => return 0,
+            OwnerState::Quarantined => return boundary::encode_kind(ErrorKind::InvalidState),
+            // 领取提交资格后停止该拥有者取得新调用。
+            OwnerState::Live => *state = OwnerState::Quarantined,
+        }
+    }
+    let status = receiver.connection.submit_release(target(&receiver.raw));
+    if status == 0 {
+        *receiver.state.lock() = OwnerState::ReleaseSubmitted;
+    }
+    status
 }
 
 pub(super) fn object_owner_drop(receiver: &mut ObjectOwner) {
-    todo!("输入（input）：self；本地步骤（local steps）：仅经ObjectOwner::submit_release有限状态出口提交；不构造Report、不分配记录、不调用来源回调；失败由宿主持续可观察，不能在Drop内改走显式release；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    receiver.submit_release();
 }
 
 pub(super) fn transfer_object_into_raw(receiver: TransferObject) -> ObjectRefV1 {
-    todo!("输入（input）：self；本地步骤（local steps）：消费唯一移交包装并标记transferred；逐字段交出原始表示；不增加持有，不直接访问来源对象；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    let mut receiver = receiver;
+    receiver.transferred = true;
+    copy_raw(&receiver.raw)
 }
 
 pub(super) fn transfer_object_drop(receiver: &mut TransferObject) {
-    todo!("输入（input）：self；本地步骤（local steps）：未交出的独立持有只提交预登记责任；已交出时不重复提交；失败继续可观察；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    if !receiver.transferred {
+        receiver.connection.submit_release(target(&receiver.raw));
+    }
 }
 
 pub(super) fn interface_with_call<I: AbiInterface, R>(
@@ -67,28 +191,209 @@ pub(super) fn interface_with_call<I: AbiInterface, R>(
     rights: u64,
     body: impl for<'call> FnOnce(InterfaceCall<'call, I>) -> Result<R>,
 ) -> Result<R> {
-    todo!("输入（input）：self, rights, body；本地步骤（local steps）：核共同权限后enter；用实际查询context、当前lease和借用连接构造调用参数；执行闭包后归还调用，失败合并且不覆盖原错误；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    if rights == 0 || rights & !(7 & I::SUPPORTED_RIGHTS) != 0 {
+        return Err(operation_error(
+            ErrorKind::PermissionDenied,
+            "interface call rights",
+        ));
+    }
+    let owner = &receiver.object.owner;
+    let call = enter_owner(owner, rights)?;
+    let result = body(InterfaceCall {
+        // SAFETY: 查询时已核准确类型（type）和表头。本次来源调用保活覆盖借用。
+        table: unsafe { &*receiver.address.pointer },
+        context: receiver.address.context,
+        lease: copy_lease(&owner.raw.lease),
+        connection: &owner.connection,
+    });
+    finish(result, call)
 }
 
 pub(super) fn interface_call_lease<'call, I: AbiInterface>(
     receiver: &InterfaceCall<'call, I>,
 ) -> LeaseV1 {
-    todo!("输入（input）：self；本地步骤（local steps）：逐字段重建当前lease传输值，不移动调用参数或建立独立持有；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    copy_lease(&receiver.lease)
 }
 
 pub(super) fn interface_call_connection<'call, I: AbiInterface>(
     receiver: &InterfaceCall<'call, I>,
 ) -> &'call Connection {
-    todo!("输入（input）：self；本地步骤（local steps）：借用同一本地连接供本次返回值接管；不泄露管理裸地址或新建权威；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    receiver.connection
 }
 
 pub(super) unsafe fn interface_call_decode<'call, I: AbiInterface>(
     receiver: &InterfaceCall<'call, I>,
     outcome: OutcomeV1,
 ) -> Result<()> {
-    todo!("输入（input）：self, outcome；本地步骤（local steps）：在尚有效的本次代码保护内把唯一Outcome交诊断出口处理；所有合法诊断均提交归还，不允许同一结果二次接管；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    if outcome.kind != 0
+        && outcome.diagnostic_failure_kind == 0
+        && !outcome.diagnostic.context.is_null()
+        && outcome.diagnostic.lease.object.source != receiver.lease.object.source
+    {
+        return Err(
+            operation_error(ErrorKind::Corrupted, "interface diagnostic source")
+                .attach(outcome.kind),
+        );
+    }
+    diagnostic::decode(receiver.connection, outcome)
 }
 
 pub(super) fn interface_clone<I: AbiInterface>(receiver: &Interface<I>) -> Interface<I> {
-    todo!("输入（input）：self；本地步骤（local steps）：共享对象本地拥有者并重建已核表地址；不解引用来源表，不创建新访问资格；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    Interface {
+        object: receiver.object.clone(),
+        address: TableAddress {
+            context: receiver.address.context,
+            pointer: receiver.address.pointer,
+            marker: PhantomData,
+        },
+    }
+}
+
+fn enter_owner(owner: &ObjectOwner, rights: u64) -> Result<crate::control::Call> {
+    if !matches!(*owner.state.lock(), OwnerState::Live) {
+        return Err(operation_error(ErrorKind::InvalidState, "object call"));
+    }
+    let operation = owner.connection.next_operation()?;
+    owner
+        .connection
+        .enter(target(&owner.raw), operation, rights)
+}
+
+fn finish<R>(operation: Result<R>, call: crate::control::Call) -> Result<R> {
+    match (operation, call.finish()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Err(secondary)) => Err(primary.attach(secondary)),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
+}
+
+unsafe fn source_table(raw: &ObjectRefV1) -> Result<&SourceApiV1> {
+    let invalid = || operation_error(ErrorKind::Corrupted, "object source table");
+    if raw.api.is_null() || !raw.api.is_aligned() {
+        return Err(invalid());
+    }
+    // SAFETY: 调用者拥有实际来源代码保活，先读取固定表头（API header）。
+    let header = unsafe { &*raw.api.cast::<ApiHeaderV1>() };
+    if header.major != 1 || header.size as usize != size_of::<SourceApiV1>() {
+        return Err(invalid());
+    }
+    // SAFETY: 已核版本、大小及地址，来源保证整个只读表有效。
+    let api = unsafe { &*raw.api };
+    if api.validate.is_none()
+        || api.retain.is_none()
+        || api.release.is_none()
+        || api.query_interface.is_none()
+    {
+        return Err(invalid());
+    }
+    Ok(api)
+}
+
+unsafe fn retain(
+    connection: &Connection,
+    input: &ObjectRefV1,
+    operation: pi_ffi_abi::OperationIdV1,
+) -> Result<TransferObject> {
+    // SAFETY: 调用者先取得原持有（original holding）的实际代码保活。
+    let api = unsafe { source_table(input)? };
+    let retain = api
+        .retain
+        .ok_or_else(|| operation_error(ErrorKind::Corrupted, "retain"))?;
+    let mut raw = ObjectRefV1 {
+        context: std::ptr::null_mut(),
+        api: std::ptr::null(),
+        lease: LeaseV1 {
+            object: ObjectKeyV1 {
+                source: 0,
+                slot: 0,
+                generation: 0,
+            },
+            initialization: InitIdV1 {
+                module_epoch: 0,
+                round: 0,
+            },
+            holding: 0,
+        },
+    };
+    // SAFETY: 已持有同一来源表及原持有。输出槽（output slot）是本地独占可写内存。
+    let outcome = unsafe { retain(input.context, copy_lease(&input.lease), operation, &mut raw) };
+    decode_source(connection, input, outcome)?;
+    if raw.context != input.context
+        || raw.api != input.api
+        || raw.lease.object.source != input.lease.object.source
+        || raw.lease.object.slot != input.lease.object.slot
+        || raw.lease.object.generation != input.lease.object.generation
+        || raw.lease.initialization.module_epoch != input.lease.initialization.module_epoch
+        || raw.lease.initialization.round != input.lease.initialization.round
+        || raw.lease.holding == 0
+        || raw.lease.holding == input.lease.holding
+    {
+        return Err(operation_error(
+            ErrorKind::Corrupted,
+            "retained holding identity",
+        ));
+    }
+    Ok(TransferObject {
+        connection: connection.clone(),
+        raw,
+        transferred: false,
+    })
+}
+
+fn decode_source(connection: &Connection, raw: &ObjectRefV1, outcome: OutcomeV1) -> Result<()> {
+    let diagnostic = &outcome.diagnostic;
+    if outcome.kind != 0
+        && outcome.diagnostic_failure_kind == 0
+        && !diagnostic.context.is_null()
+        && (diagnostic.context != raw.context
+            || diagnostic.lease.object.source != raw.lease.object.source
+            || diagnostic.lease.initialization.module_epoch
+                != raw.lease.initialization.module_epoch
+            || diagnostic.lease.initialization.round != raw.lease.initialization.round)
+    {
+        return Err(
+            operation_error(ErrorKind::Corrupted, "object diagnostic source").attach(outcome.kind),
+        );
+    }
+    diagnostic::decode(connection, outcome)
+}
+
+fn operation_error(kind: ErrorKind, operation: &'static str) -> Error {
+    Error::new(kind).attach(pi_result::attachment::Operation(operation))
+}
+
+fn target(raw: &ObjectRefV1) -> CallTargetV1 {
+    CallTargetV1 {
+        context: raw.context,
+        api: raw.api.cast(),
+        lease: copy_lease(&raw.lease),
+        kind: TARGET_OBJECT,
+    }
+}
+
+fn copy_raw(raw: &ObjectRefV1) -> ObjectRefV1 {
+    ObjectRefV1 {
+        context: raw.context,
+        api: raw.api,
+        lease: copy_lease(&raw.lease),
+    }
+}
+
+fn copy_round(round: &InitIdV1) -> InitIdV1 {
+    InitIdV1 {
+        module_epoch: round.module_epoch,
+        round: round.round,
+    }
+}
+
+fn copy_lease(lease: &LeaseV1) -> LeaseV1 {
+    LeaseV1 {
+        object: ObjectKeyV1 {
+            source: lease.object.source,
+            slot: lease.object.slot,
+            generation: lease.object.generation,
+        },
+        initialization: copy_round(&lease.initialization),
+        holding: lease.holding,
+    }
 }
