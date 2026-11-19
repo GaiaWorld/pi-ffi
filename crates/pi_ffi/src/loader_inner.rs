@@ -1,5 +1,5 @@
 use super::*;
-use crate::package::{BuildFile, Target};
+use crate::package::{BuildDependency, BuildFile, DependencyUse, Target};
 use object::{Architecture, BinaryFormat, ExportTarget, NameOrOrdinal, Object, ObjectKind};
 use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V1, METADATA_V1};
 use pi_result::{attachment::PathAttachment, Error, ErrorKind};
@@ -382,11 +382,240 @@ pub(super) fn verify_image(
     module: &NativeModule,
     files: Arc<VerifiedFiles>,
 ) -> Result<VerifiedImage> {
-    todo!("在真实持有内确认实际主映像、必需的实际配套依赖及三个确切入口来源。拒绝未知实际归属和可见冲突。")
+    let identity = super::mapped_identity(module)?;
+    let mapped_path = mapped_module_path(module)?;
+    let actual =
+        live_file_identity(&mapped_path).map_err(|failure| io_error(failure, &mapped_path))?;
+    if actual != files.main.identity {
+        return Err(loader_error(ErrorKind::Conflict, "mapped plugin file")
+            .attach(PathAttachment(mapped_path))
+            .attach(PathAttachment(files.main.path.clone())));
+    }
+    let required = required_linked_dependencies(&files)?;
+    let dependencies = verify_mapped_dependencies(&files, |index, _| required[index])?;
+    let metadata = verify_entry(module, identity, METADATA_V1)?;
+    let initialize = verify_entry(module, identity, INITIALIZE_V1)?;
+    let close = verify_entry(module, identity, CLOSE_V1)?;
+    // SAFETY: 受管制品的三个直接导出（direct exports）有固定 C 签名。
+    // 入口地址均已核对归属于本次持有的同一实际文件。
+    let entries = unsafe {
+        Entrypoints {
+            metadata: std::mem::transmute::<*const core::ffi::c_void, MetadataFnV1>(metadata),
+            initialize: std::mem::transmute::<*const core::ffi::c_void, InitializeFnV1>(initialize),
+            close: std::mem::transmute::<*const core::ffi::c_void, CloseFnV1>(close),
+        }
+    };
+    Ok(VerifiedImage {
+        identity,
+        entries,
+        files,
+        dependencies,
+    })
 }
 
 pub(super) fn check_inputs(image: &VerifiedImage, has_runtime: bool) -> Result<()> {
-    todo!("标准初始化前重核所需 Rust 库实际映射及分配者。Config 和终端的条件始终核，运行时的原生交接条件按实际有无核。")
+    let files = &image.files;
+    let observed = verify_mapped_dependencies(files, |index, declaration| {
+        declaration.usage != DependencyUse::RuntimeInput
+            || has_runtime
+            || image
+                .dependencies
+                .iter()
+                .any(|dependency| files.dependencies[index].identity == dependency.file)
+    })?;
+    if image.dependencies.iter().any(|previous| {
+        !observed
+            .iter()
+            .any(|current| current.file == previous.file && current.identity == previous.identity)
+    }) {
+        return Err(loader_error(
+            ErrorKind::Conflict,
+            "linked dependency mapping changed",
+        ));
+    }
+    // 配置（Config）与终端（terminal）的宿主适配代码来自同一 Rust 动态库（dylib）。
+    // 以宿主实际代码地址核对该制品。分配器（allocator）约定来自此前核准的不可变构建记录。
+    let host_adapter = mapped_address_identity(
+        pi_ffi_adapters::config::ConfigInput::take as *const core::ffi::c_void,
+    )?;
+    let shared = files
+        .package
+        .manifest()
+        .dependencies
+        .iter()
+        .zip(&files.dependencies)
+        .filter(|(declaration, _)| declaration.usage == DependencyUse::SharedRust);
+    if !shared.into_iter().any(|(_, file)| {
+        observed.iter().any(|dependency| {
+            dependency.file == file.identity && dependency.identity == host_adapter
+        })
+    }) {
+        return Err(loader_error(
+            ErrorKind::Dependency,
+            "host shared Rust adapter",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_entry(
+    module: &NativeModule,
+    identity: MappedIdentity,
+    name: &std::ffi::CStr,
+) -> Result<*const core::ffi::c_void> {
+    // SAFETY: 此处只取得地址（address），在归属检查前不把它当作入口调用。
+    let symbol = unsafe {
+        module
+            .system
+            .get::<*const core::ffi::c_void>(name.to_bytes_with_nul())
+    }
+    .map_err(|failure| {
+        native_error("resolve management export", failure)
+            .attach(name.to_string_lossy().into_owned())
+    })?;
+    let address = symbol.as_raw_ptr().cast_const();
+    if mapped_address_identity(address)? != identity {
+        return Err(
+            loader_error(ErrorKind::Conflict, "management export mapping")
+                .attach(name.to_string_lossy().into_owned()),
+        );
+    }
+    Ok(address)
+}
+
+fn live_file_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    let file = open_readonly(path)?;
+    live_open_identity(&file)
+}
+
+fn live_open_identity(file: &File) -> std::io::Result<FileIdentity> {
+    opened_identity(file, &file.metadata()?)
+}
+
+fn required_linked_dependencies(files: &VerifiedFiles) -> Result<Vec<bool>> {
+    let manifest = files.package.manifest();
+    let mut required = manifest
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.usage != DependencyUse::RuntimeInput)
+        .collect::<Vec<_>>();
+    if required.iter().all(|&linked| linked) {
+        return Ok(required);
+    }
+
+    // 主映像和始终使用的配套库都是普通链接（ordinary linking）的起点。
+    // 首次发现的依赖才加入待查，传递依赖成环时也只读一次。
+    let mut pending = vec![&files.main];
+    pending.extend(
+        files.dependencies.iter().zip(&required).filter_map(
+            |(file, &linked)| linked.then_some(file),
+        ),
+    );
+    while let Some(file) = pending.pop() {
+        let bytes = read_verified_binary(file)?;
+        let binary = object::File::parse(bytes.as_slice())
+            .map_err(|failure| binary_error(failure).attach(PathAttachment(file.path.clone())))?;
+        for import in binary.import_libraries().map_err(binary_error)? {
+            let import = import.map_err(binary_error)?;
+            let Some(index) = manifest.dependencies.iter().position(|dependency| {
+                same_load_name(manifest.target, dependency.load_name.as_bytes(), import.name())
+            }) else {
+                continue;
+            };
+            if !required[index] {
+                required[index] = true;
+                pending.push(&files.dependencies[index]);
+            }
+        }
+    }
+    Ok(required)
+}
+
+fn read_verified_binary(verified: &VerifiedFile) -> Result<Vec<u8>> {
+    let path = &verified.path;
+    let mut file = open_readonly(path).map_err(|failure| io_error(failure, path))?;
+    let identity = live_open_identity(&file).map_err(|failure| io_error(failure, path))?;
+    if identity != verified.identity {
+        return Err(loader_error(ErrorKind::Conflict, "linked import file identity")
+            .attach(PathAttachment(path.clone())));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|failure| io_error(failure, path))?;
+    Ok(bytes)
+}
+
+struct MappedFile {
+    identity: MappedIdentity,
+    path: PathBuf,
+    file: std::io::Result<FileIdentity>,
+}
+
+fn verify_mapped_dependencies(
+    files: &VerifiedFiles,
+    required: impl Fn(usize, &BuildDependency) -> bool,
+) -> Result<Vec<MappedDependency>> {
+    let manifest = files.package.manifest();
+    let required = manifest
+        .dependencies
+        .iter()
+        .zip(&files.dependencies)
+        .enumerate()
+        .filter(|(index, (declaration, _))| required(*index, declaration))
+        .map(|(_, item)| item)
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mapped = process_mapped_paths()?
+        .into_iter()
+        .map(|(identity, path)| MappedFile {
+            identity,
+            file: live_file_identity(&path),
+            path,
+        })
+        .collect::<Vec<_>>();
+    let mut verified = Vec::with_capacity(required.len());
+    for (declaration, expected) in required {
+        let mut found = None;
+        for observed in &mapped {
+            let known_name = observed.path == expected.path
+                || observed.path.file_name().is_some_and(|file_name| {
+                    same_load_name(
+                        manifest.target,
+                        file_name.as_encoded_bytes(),
+                        declaration.load_name.as_bytes(),
+                    )
+                });
+            if observed.file.as_ref().ok() == Some(&expected.identity) {
+                if found.is_some_and(|existing| existing != observed.identity) {
+                    return Err(
+                        loader_error(ErrorKind::Conflict, "multiple dependency mappings")
+                            .attach(declaration.load_name.clone()),
+                    );
+                }
+                found = Some(observed.identity);
+            } else if known_name {
+                let conflict = loader_error(ErrorKind::Conflict, "mapped dependency file")
+                    .attach(declaration.load_name.clone())
+                    .attach(PathAttachment(observed.path.clone()));
+                return Err(match &observed.file {
+                    Ok(_) => conflict,
+                    Err(failure) => conflict.attach(failure.to_string()),
+                });
+            }
+        }
+        let identity = found.ok_or_else(|| {
+            loader_error(ErrorKind::Dependency, "missing mapped dependency")
+                .attach(declaration.load_name.clone())
+                .attach(PathAttachment(expected.path.clone()))
+        })?;
+        verified.push(MappedDependency {
+            identity,
+            file: expected.identity,
+        });
+    }
+    Ok(verified)
 }
 
 pub(super) unsafe fn copy_metadata(image: &VerifiedImage, raw: MetadataV1) -> Result<Metadata> {
@@ -475,6 +704,213 @@ fn linux_link_map(module: &NativeModule) -> Result<*mut ElfLinkMapPrefix> {
     Ok(mapping)
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn mapped_module_path(module: &NativeModule) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mapping = linux_link_map(module)?;
+    // SAFETY: 本模块的实际系统引用（system reference）使已查到的 link_map 及名称继续存续。
+    let name = unsafe { (*mapping).file_name };
+    if name.is_null() {
+        return Err(loader_error(ErrorKind::Corrupted, "mapped plugin path"));
+    }
+    // SAFETY: GNU 动态加载器提供以零字节结束的映像文件名称。
+    let path = unsafe { std::ffi::CStr::from_ptr(name).to_bytes() };
+    if path.is_empty() {
+        return Err(loader_error(ErrorKind::Corrupted, "mapped plugin path"));
+    }
+    Ok(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn mapped_module_path(module: &NativeModule) -> Result<PathBuf> {
+    windows_module_path(module.handle as windows_sys::Win32::Foundation::HMODULE)
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn windows_module_path(module: windows_sys::Win32::Foundation::HMODULE) -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+
+    let mut path = vec![0u16; 32_768];
+    // SAFETY: 路径输出槽（path buffer）独占可写，借用系统句柄用于查询。
+    let written = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) };
+    if written == 0 || written as usize == path.len() {
+        return Err(loader_error(ErrorKind::Io, "read mapped module path")
+            .attach(std::io::Error::last_os_error()));
+    }
+    Ok(PathBuf::from(std::ffi::OsString::from_wide(
+        &path[..written as usize],
+    )))
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn mapped_address_identity(address: *const core::ffi::c_void) -> Result<MappedIdentity> {
+    linux_mapping_by_address(address)
+        .map(|mapping| MappedIdentity {
+            address: mapping.addr(),
+        })
+        .ok_or_else(|| loader_error(ErrorKind::Corrupted, "native address owner"))
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn mapped_address_identity(address: *const core::ffi::c_void) -> Result<MappedIdentity> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    let mut owner = std::ptr::null_mut();
+    // SAFETY: 按地址只查询归属（address ownership）。输出槽独占可写，标志要求不新增系统引用。
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            address.cast(),
+            &mut owner,
+        )
+    };
+    if found == 0 || owner.is_null() {
+        return Err(loader_error(ErrorKind::Io, "native address owner")
+            .attach(std::io::Error::last_os_error()));
+    }
+    Ok(MappedIdentity {
+        address: owner.addr(),
+    })
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+struct LinuxMappedPath {
+    address: usize,
+    path: PathBuf,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn process_mapped_paths() -> Result<Vec<(MappedIdentity, PathBuf)>> {
+    let mut paths = Vec::<LinuxMappedPath>::new();
+    // SAFETY: 系统同步枚举（enumeration）时原样传回本地独占容器，回调不保留系统指针。
+    let status = unsafe {
+        libc::dl_iterate_phdr(
+            Some(linux_collect_mapped_path),
+            std::ptr::from_mut(&mut paths).cast(),
+        )
+    };
+    if status != 0 {
+        return Err(loader_error(
+            ErrorKind::ResourceExhausted,
+            "enumerate mapped modules",
+        ));
+    }
+    // 离开系统枚举锁后查询每段的归属（address ownership）。
+    Ok(paths
+        .into_iter()
+        .filter_map(|entry| {
+            let identity =
+                mapped_address_identity(std::ptr::without_provenance(entry.address)).ok()?;
+            Some((identity, entry.path))
+        })
+        .collect())
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+unsafe extern "C" fn linux_collect_mapped_path(
+    info: *mut libc::dl_phdr_info,
+    size: usize,
+    data: *mut core::ffi::c_void,
+) -> libc::c_int {
+    if size < size_of::<libc::dl_phdr_info>() {
+        return 0;
+    }
+    use std::os::unix::ffi::OsStringExt;
+    // SAFETY: 系统提供本次枚举记录，及调用方提供的独占本地容器。
+    let (info, paths) = unsafe { (&*info, &mut *data.cast::<Vec<LinuxMappedPath>>()) };
+    if info.dlpi_name.is_null() || info.dlpi_phdr.is_null() {
+        return 0;
+    }
+    // SAFETY: 动态加载器（dynamic loader）在回调内使名称和程序头表（program header table）保持有效。
+    let (name, headers) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(info.dlpi_name).to_bytes(),
+            std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)),
+        )
+    };
+    if name.is_empty() {
+        return 0;
+    }
+    let Some(loaded) = headers
+        .iter()
+        .find(|header| header.p_type == libc::PT_LOAD && header.p_memsz != 0)
+    else {
+        return 0;
+    };
+    let mut bytes = Vec::new();
+    if paths.try_reserve(1).is_err() || bytes.try_reserve_exact(name.len()).is_err() {
+        return 1;
+    }
+    bytes.extend_from_slice(name);
+    paths.push(LinuxMappedPath {
+        address: (info.dlpi_addr as usize).wrapping_add(loaded.p_vaddr as usize),
+        path: PathBuf::from(std::ffi::OsString::from_vec(bytes)),
+    });
+    0
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn process_mapped_paths() -> Result<Vec<(MappedIdentity, PathBuf)>> {
+    use windows_sys::Win32::{
+        Foundation::HMODULE,
+        System::{ProcessStatus::K32EnumProcessModules, Threading::GetCurrentProcess},
+    };
+    let mut modules = vec![std::ptr::null_mut::<core::ffi::c_void>(); 32];
+    let mut needed = 0;
+    loop {
+        let available = modules
+            .len()
+            .checked_mul(size_of::<HMODULE>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| {
+                loader_error(ErrorKind::ResourceExhausted, "enumerate mapped modules")
+            })?;
+        // SAFETY: 只查询当前进程（current process），两个输出槽各自独占且长度准确。
+        let result = unsafe {
+            K32EnumProcessModules(
+                GetCurrentProcess(),
+                modules.as_mut_ptr(),
+                available,
+                &mut needed,
+            )
+        };
+        if result == 0 {
+            return Err(loader_error(ErrorKind::Io, "enumerate mapped modules")
+                .attach(std::io::Error::last_os_error()));
+        }
+        let count = needed as usize / size_of::<HMODULE>();
+        if needed <= available {
+            modules.truncate(count);
+            break;
+        }
+        modules
+            .try_reserve_exact(count - modules.len())
+            .map_err(|failure| {
+                loader_error(ErrorKind::ResourceExhausted, "enumerate mapped modules")
+                    .attach(failure)
+            })?;
+        modules.resize(count, std::ptr::null_mut());
+    }
+    Ok(modules
+        .into_iter()
+        .filter_map(|module| {
+            if module.is_null() {
+                return None;
+            }
+            let path = windows_module_path(module).ok()?;
+            Some((
+                MappedIdentity {
+                    address: module.addr(),
+                },
+                path,
+            ))
+        })
+        .collect())
+}
+
 pub(super) fn verified_manifest(files: &VerifiedFiles) -> &BuildManifest {
     files.package.manifest()
 }
@@ -496,18 +932,14 @@ struct ElfMetadataRange {
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 fn mapped_metadata_range(identity: MappedIdentity, version: *const u8, end: usize) -> bool {
-    // glibc 的 dlfcn.h 为此值指定 link_map 输出槽（output slot）。
-    const RTLD_DL_LINKMAP: libc::c_int = 2;
-    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
-    let mut map = std::ptr::null_mut();
-    // SAFETY: dladdr1 按数值查询地址，两个输出槽独占可写且大小准确。
-    let found =
-        unsafe { libc::dladdr1(version.cast(), info.as_mut_ptr(), &mut map, RTLD_DL_LINKMAP) };
-    if found == 0 || map.is_null() || map.addr() != identity.address {
+    let Some(map) = linux_mapping_by_address(version.cast()) else {
+        return false;
+    };
+    if map.addr() != identity.address {
         return false;
     }
     // SAFETY: 查询返回了调用方仍持有的同一 link_map。只读取 GNU 公开布局的前两项。
-    let map = unsafe { &*map.cast::<ElfLinkMapPrefix>() };
+    let map = unsafe { &*map };
     let mut range = ElfMetadataRange {
         load_bias: map.load_bias,
         file_name: map.file_name,
@@ -521,6 +953,17 @@ fn mapped_metadata_range(identity: MappedIdentity, version: *const u8, end: usiz
             std::ptr::from_mut(&mut range).cast(),
         ) == 1
     }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn linux_mapping_by_address(address: *const core::ffi::c_void) -> Option<*mut ElfLinkMapPrefix> {
+    // glibc 的 dlfcn.h 为此值指定 link_map 输出槽（output slot）。
+    const RTLD_DL_LINKMAP: libc::c_int = 2;
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    let mut map = std::ptr::null_mut();
+    // SAFETY: dladdr1 按数值查询地址，两个输出槽独占可写且大小准确。
+    let found = unsafe { libc::dladdr1(address, info.as_mut_ptr(), &mut map, RTLD_DL_LINKMAP) };
+    (found != 0 && !map.is_null()).then_some(map.cast())
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
