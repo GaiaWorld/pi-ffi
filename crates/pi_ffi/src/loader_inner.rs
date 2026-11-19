@@ -915,6 +915,13 @@ pub(super) fn verified_manifest(files: &VerifiedFiles) -> &BuildManifest {
     files.package.manifest()
 }
 
+pub(super) fn verified_files_match_reuse(
+    current: &VerifiedFiles,
+    candidate: &VerifiedFiles,
+) -> bool {
+    todo!("只比较现有资料。核目标平台、主文件身份和摘要、配套构建摘要、分配器和静态声明归属。按目标平台既有加载名规则逐项核对两份依赖的用途、摘要和已打开文件身份。声明顺序和同一文件的不同路径不改变结果。")
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
 #[repr(C)]
 struct ElfLinkMapPrefix {

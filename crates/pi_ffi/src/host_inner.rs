@@ -56,7 +56,7 @@ pub(super) fn manager_load(
     package: &PluginPackage,
     request: &PluginRequest,
 ) -> Result<Plugin> {
-    todo!("装入前校版本请求和构建记录；预留文件记录。通过实际装入记录在锁外装入，先记实际映像再校验配套及入口。受保护读取并复制元信息。新的清单和实际版本范围都须匹配已有模块副本。复用前显式归还多取的引用。失败保留实际受影响的映像和占用。装入后失败保留真实释放结果。")
+    todo!("装入前核版本请求和构建记录。预留文件记录，首次装入后先记实际映像，再核配套及入口，受保护读取并复制元信息。调用方的版本范围对本次实际宿主副本成立才成功。同文件复用使用既有副本；首次装入及复用失败均保留已知的实际和批准身份或完整版本。失败保留实际归还结果。")
 }
 
 pub(super) fn manager_maintain(manager: &Manager, budget: usize) -> Result<usize> {

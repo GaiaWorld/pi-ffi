@@ -152,6 +152,14 @@ impl VerifiedFiles {
     pub(crate) fn manifest(&self) -> &BuildManifest {
         inner::verified_manifest(self)
     }
+
+    /// 对照两份已核资料的主文件、配套依赖、构建和静态声明归属。
+    /// 名称按目标平台比较。路径别名和声明顺序不改变实际文件身份。
+    /// 只读取已有资料。插件身份与版本由宿主从元信息核对。
+    // @trace 11
+    pub(crate) fn matches_reuse(&self, candidate: &Self) -> bool {
+        inner::verified_files_match_reuse(self, candidate)
+    }
 }
 
 /// 在有效系统引用内取得实际映像标识，尚不调用任何插件入口。

@@ -32,7 +32,7 @@ pub(super) fn authority_reserve_load(
     authority: &'static Authority,
     files: Arc<VerifiedFiles>,
 ) -> Result<LoadAdmission> {
-    todo!("按实际文件登记即将装入的唯一记录并保存实际文件持有。仅用仍有效的文件记录核对同文件复用。复用前核新清单的 UUID 和完整版本、构建及已核宿主元信息。实际请求再经 host 核对。尚在执行或结果不确定时返回相应失败。")
+    todo!("按实际文件登记唯一装入。已有记录时，短锁内只从实际映像、系统引用及资料齐备的已装入记录取得原代际和文件及元信息的共享持有。还在处理或结果未确认时按原状态返回。锁外用宿主副本核身份和完整版本，差异返回带原实际值和批准值的 pi_result。经 VerifiedFiles::matches_reuse 核新资料。兼容时重新在短锁内核原代际、已装入状态及原资料，才交付复用。实际请求再经 host 核对。")
 }
 
 pub(super) fn authority_reserve_round(
@@ -185,7 +185,7 @@ pub(super) fn system_confirm_loaded(
     image: VerifiedImage,
     metadata: Metadata,
 ) -> Result<ModuleView> {
-    todo!("先完成发布所需准备。新模块将持有原子登记。已知实际同模块匹配时显式归还额外引用。确认额外引用归还后，结束候选记录、清空其旧映像标识并在锁外放掉文件和映像资料，再交付复用入口。错误由原装入记录接受。")
+    todo!("先完成发布所需准备。新模块将持有原子登记。发现已有相同实际模块时，沿同一规则在锁外核宿主元信息和新资料。差异经本次候选拒绝路径显式归还。相符时显式归还额外引用，确认后在短锁内清空候选映像标识并移出文件和映像资料，锁外结束原持有。复核已有模块为原代际、原资料和已装入状态之后才交付复用。释放未确认沿原合同处理。")
 }
 
 pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
