@@ -83,6 +83,8 @@ enum ModulePhase {
 
 struct RoundRecord {
     id: InitIdV1,
+    // 本轮已发出的操作号（operation identifier）。实际动作仍由其原记录保存。
+    issued_operations: Vec<OperationIdV1>,
     phase: RoundPhase,
     inputs: Option<Arc<PreparedInputs>>,
     connection: Option<Connection>,

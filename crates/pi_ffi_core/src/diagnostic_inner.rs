@@ -132,7 +132,15 @@ pub(super) fn capture_management_failure(error: &Error) -> ManagementFailure {
     ManagementFailure {
         cached,
         cleanup_unconfirmed,
+        report_cleanup: None,
     }
+}
+
+pub(super) fn management_failure_finish_report_cleanup(
+    failure: ManagementFailure,
+    disposal: Option<(ErrorKind, String)>,
+) -> (ManagementFailure, bool) {
+    todo!("消费本地快照及原报告受保护销毁的结果。使用原有清理标记与实际销毁结果。确认可继续时原样保留错误。清理未确认时保留原分类、已取得的三段文本以及实际销毁诊断；原 Busy 归为 Internal。分别存原分类、已知实际清理分类和可取得的材料。来源后续维护或退役使用实际清理分类为主并保留原分类。原诊断不可取得时仅根据原分类和现有诊断材料形成报告。最终快照的报告类别和交付类别一致，标记保留。不再次执行用户报告格式化，不建立来源诊断持有。")
 }
 
 pub(super) fn management_failure_without_source(failure: &ManagementFailure) -> OutcomeV1 {

@@ -89,7 +89,7 @@ fn publish<T: Send + Sync + 'static>(
 
 - `boundary::Context` 保存当前操作、已知模块、轮号与来源。`boundary::catch` 在本地 Rust 构建捕获合同允许的恐慌（panic），保持普通 `pi_result`。调用方须先建立恢复责任。
 - `CopiedDiagnostic` 存储宿主自有的原 `user`、`verbose`、`debug` 文本及分类。`into_error` 构成接收方报告，可用 `diagnostic::copied_diagnostic` 读回三段原文本。
-- `ManagementFailure::capture` 在来源一侧提取报告文本。`Registry::publish_management_failure` 发布可唯一接管的诊断。来源不可用时，`without_source` 可返回原操作和诊断建立的两项分类。
+- `ManagementFailure::capture` 在来源一侧提取报告文本。原报告在保护内销毁后，用 `finish_report_cleanup` 合并实际结果并保留已有诊断。随后由 `Registry::publish_management_failure` 发布可唯一接管的诊断。来源不可用时，用 `without_source` 返回快照的操作和诊断建立分类。
 - `diagnostic::success_outcome`、`limited_outcome`、`status_code` 表达约定的 C 结果及分类。`protect_outcome` 和 `protect_status` 用于各自 C 边界的最外层保护。
 - `diagnostic::decode_management` 在模块有效的受保护标准调用中唯一接管管理结果。携带独立诊断时，需要已经匹配来源、实际模块及本轮连接；没有合法来源时只能接收成功或有限失败。
 

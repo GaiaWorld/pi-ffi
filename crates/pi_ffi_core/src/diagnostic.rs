@@ -98,6 +98,13 @@ pub struct ManagementFailure {
     pub(crate) cached: CachedFailure,
     /// 原错误或诊断格式化过程含尚未确认的清理。
     pub(crate) cleanup_unconfirmed: bool,
+    pub(crate) report_cleanup: Option<ReportCleanup>,
+}
+
+/// 原错误与实际清理错误（cleanup error）的分类。
+pub(crate) struct ReportCleanup {
+    pub(crate) original_kind: ErrorKind,
+    pub(crate) cleanup_kind: ErrorKind,
 }
 
 impl ManagementFailure {
@@ -108,7 +115,21 @@ impl ManagementFailure {
         inner::capture_management_failure(error)
     }
 
-    /// 没有可用来源时投影原操作及诊断建立的两项分类。
+    /// 根据已知清理结果完成本地管理错误（management error）。
+    ///
+    /// 原报告正常销毁时给 None。销毁未确认时给已捕获的分类和本地诊断文本。
+    /// 返回更新后的快照与清理是否仍未确认。保留已经取得的原诊断。
+    /// 原 Busy 因清理未确认需要结束本次尝试时，返回 Internal 并保存原分类说明。
+    // @trace 21
+    pub fn finish_report_cleanup(
+        self,
+        disposal: Option<(ErrorKind, String)>,
+    ) -> (Self, bool) {
+        inner::management_failure_finish_report_cleanup(self, disposal)
+    }
+
+    /// 没有可用来源时投影快照的操作及诊断建立分类。
+    /// 合并清理结果后使用已经确定的最终分类。
     // @trace 14
     pub fn without_source(&self) -> OutcomeV1 {
         inner::management_failure_without_source(self)

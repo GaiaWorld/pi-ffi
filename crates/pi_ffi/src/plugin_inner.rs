@@ -75,7 +75,7 @@ pub(super) unsafe fn export_initialize_without_runtime<
     config: *const ObjectRefV1,
     initialize: impl FnOnce(Inputs<T>, &mut Option<S>) -> Result<()>,
 ) -> InitReplyV1 {
-    todo!("复用同一标准初始化与诊断路径。有运行时输入则在取走配置以前拒绝。缺席时只接收真实终端和配置。")
+    todo!("用同一 C 边界保护检查和拒绝有运行时输入的情况，取配置前完成检查。提前返回时也在保护内销毁未调用的初始化闭包。缺席时只接收真实终端和配置。")
 }
 
 pub(super) unsafe fn export_close<S: Send + 'static>(
@@ -83,5 +83,5 @@ pub(super) unsafe fn export_close<S: Send + 'static>(
     id: InitIdV1,
     close: impl FnOnce(&mut Option<S>) -> Result<()>,
 ) -> OutcomeV1 {
-    todo!("保护完整 C 入口。只占用原轮次并在锁外退出，保存 Busy 的真实进度。成功后实施单次析构。最终失败保留原因并禁止重做不确定操作。关闭确认后记录无来源持有的结果，在锁外归还诊断来源。")
+    todo!("保护完整 C 入口。只占用原轮次并在锁外退出，保存 Busy 的真实进度。成功后实施单次析构。采集原错误后，在保护内析构原报告。用 ManagementFailure::finish_report_cleanup 得到最终快照及清理确认结果。清理未确认时保存终局失败；原 Busy 归为 Internal，诊断保留原分类及现有材料，后续只重放。关闭确认后记录无来源持有的结果，在锁外归还诊断来源。")
 }
