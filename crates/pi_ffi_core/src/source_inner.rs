@@ -141,3 +141,10 @@ pub(super) unsafe fn maintain(
 pub(super) unsafe fn release_context(context: *mut core::ffi::c_void, source: u64) -> u32 {
     todo!("输入（input）：context, source；本地步骤（local steps）：仅在最终独占控制阶段接收已清空上下文的唯一拥有权；锁外释放；失败或结果不确定后不再解释该地址；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
 }
+
+pub(super) fn publish_management_failure(
+    registry: &Registry,
+    failure: &crate::diagnostic::ManagementFailure,
+) -> OutcomeV1 {
+    todo!("复用本来源诊断登记及宿主预登记。每次创建独立持有，允许合法关闭报告，失败时返回两项分类。")
+}

@@ -87,3 +87,72 @@ pub(crate) fn copy_and_release(
 pub(crate) fn decode(connection: &Connection, outcome: OutcomeV1) -> Result<()> {
     inner::decode(connection, outcome)
 }
+
+/// 可重复发送的管理错误（management error）快照。
+/// 每次发送都新建独立诊断持有。
+pub struct ManagementFailure {
+    pub(crate) cached: CachedFailure,
+}
+
+impl ManagementFailure {
+    /// 在本地提取 pi_result 分类和三段诊断。
+    // @trace 13
+    pub fn capture(error: &Error) -> Self {
+        inner::capture_management_failure(error)
+    }
+
+    /// 没有可用来源时投影原操作及诊断建立的两项分类。
+    // @trace 14
+    pub fn without_source(&self) -> OutcomeV1 {
+        inner::management_failure_without_source(self)
+    }
+}
+
+/// 形成没有诊断持有的成功结果。
+/* 共同结果的零字段由本模块统一构造。 */
+// @trace 15
+pub fn success_outcome() -> OutcomeV1 {
+    inner::success_outcome()
+}
+
+/// 两项分类的有限失败。用在无法建立独立诊断的情况。
+// @trace 16
+pub fn limited_outcome(operation: ErrorKind, diagnostic: ErrorKind) -> OutcomeV1 {
+    inner::limited_outcome(operation, diagnostic)
+}
+
+/// 把 pi_result 公共分类投影到受控 C 状态码。
+// @trace 17
+pub fn status_code(kind: ErrorKind) -> u32 {
+    inner::status_code(kind)
+}
+
+/// 保护完整的标准 C 管理结果，包括诊断失败及可展开恐慌。
+// @trace 18
+pub fn protect_outcome(
+    context: crate::boundary::Context,
+    body: impl FnOnce() -> OutcomeV1,
+) -> OutcomeV1 {
+    inner::protect_outcome(context, body)
+}
+
+/// 保护仅返回有限状态的共同 C 操作。
+// @trace 19
+pub fn protect_status(context: crate::boundary::Context, body: impl FnOnce() -> u32) -> u32 {
+    inner::protect_status(context, body)
+}
+
+/// 从受保护的标准管理调用取得宿主自有 pi_result。
+///
+/// # Safety
+///
+/// 调用方持有本次标准入口的实际模块，独立诊断仅移交一次。
+/// 有独立诊断时，连接应为本轮，先验证来源登记及模块归属，再调用来源表。
+/// 无轮次或来源时只能接受成功或有限失败，不解引用返回指针。
+// @trace 20
+pub unsafe fn decode_management(
+    connection: Option<&Connection>,
+    outcome: OutcomeV1,
+) -> Result<()> {
+    unsafe { inner::decode_management(connection, outcome) }
+}

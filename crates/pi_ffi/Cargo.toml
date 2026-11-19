@@ -1,0 +1,21 @@
+[package]
+name = "pi_ffi"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+parking_lot.workspace = true
+pi_ffi_abi.workspace = true
+pi_ffi_core = { version = "0.1", path = "../pi_ffi_core" }
+pi_ffi_adapters = { version = "0.1", path = "../pi_ffi_adapters" }
+pi_result.workspace = true
+libloading = "0.9"
+object = { version = "0.41", default-features = false, features = ["read_core", "elf", "pe", "std"] }
+semver = "1.0"
+sha2 = "0.11"
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

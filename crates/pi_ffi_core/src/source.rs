@@ -642,3 +642,14 @@ pub(crate) unsafe extern "C" fn release_context(
         || unsafe { inner::release_context(context, source) },
     )
 }
+
+impl Registry {
+    /// 每次发布一份独立诊断，已有快照可用于重放。
+    // @trace 45
+    pub fn publish_management_failure(
+        &self,
+        failure: &crate::diagnostic::ManagementFailure,
+    ) -> OutcomeV1 {
+        inner::publish_management_failure(self, failure)
+    }
+}

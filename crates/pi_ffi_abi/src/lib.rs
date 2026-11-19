@@ -282,3 +282,6 @@ pub struct HostControlApiV1 {
     /// 推进指定来源退役；全部清理及上下文释放成功后才结束来源代码保活。
     pub retire_source: Option<unsafe extern "C" fn(*mut c_void, u64, OperationIdV1) -> OutcomeV1>,
 }
+
+/// 插件的三项同步管理导出（management exports）。
+pub mod management;
