@@ -1,8 +1,6 @@
 #![no_std]
 #![doc(html_no_source)]
-//! 受控C表示（controlled C representation）及固定操作表。
-//! 传输字段不拥有资源；复制字段不增加持有，不使原始地址自动有效。
-//! 所有不安全调用都要求真实代码／上下文存续、正确布局及相应权限。
+#![doc = include_str!("../README.md")]
 
 use core::ffi::c_void;
 

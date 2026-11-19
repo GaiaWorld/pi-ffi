@@ -1,5 +1,5 @@
 #![doc(html_no_source)]
-//! 宿主（host）管理与插件（plugin）标准接入。
+#![doc = include_str!("../README.md")]
 
 mod authority;
 pub mod host;

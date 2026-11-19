@@ -2,17 +2,17 @@
 
 `pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、初始化、维护、关闭和卸载符合约定的 Rust 插件动态库（plugin dynamic library），安全交接初始化入参并支持运行时（runtime）替换。本库提供插件在标准初始化时汇总并登记其静态服务（static service）的接入。
 
-**当前仓库包含设计骨架（design skeleton）。** 四个运行期库和可选编译期宏提供接口声明。实现中的 `todo!()` 会触发恐慌（panic）。本页手工封装示例已核对 Rust 类型和 Linux 导出；宏展开与运行验证在实现完成后进行。
+**当前仓库包含设计骨架（design skeleton）。** 四个运行期库和可选编译期宏已提供入口声明。完整插件运行能力以相应发布版本的验证结果为准。
 
 工作区（workspace）各库的职责如下。
 
 | 库（crate） | 当前职责 |
 | --- | --- |
-| [pi_ffi_abi](crates/pi_ffi_abi/src/lib.rs) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
-| [pi_ffi_core](crates/pi_ffi_core/src/lib.rs) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
-| [pi_ffi_adapters](crates/pi_ffi_adapters/src/lib.rs) | 运行时（runtime）、配置（Config）和 P2P 终端（terminal）的接入 |
-| [pi_ffi](crates/pi_ffi/src/lib.rs) | 宿主（host）管理和插件的三个标准入口 |
-| [pi_ffi_macros](crates/pi_ffi_macros/src/lib.rs) | 可选过程宏（procedural macro），在编译期生成标准导出 |
+| [pi_ffi_abi](crates/pi_ffi_abi/README.md) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
+| [pi_ffi_core](crates/pi_ffi_core/README.md) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
+| [pi_ffi_adapters](crates/pi_ffi_adapters/README.md) | 运行时（runtime）、配置（Config）和 P2P 终端（terminal）的接入 |
+| [pi_ffi](crates/pi_ffi/README.md) | 宿主（host）管理和插件的三个标准入口 |
+| [pi_ffi_macros](crates/pi_ffi_macros/README.md) | 可选过程宏（procedural macro），在编译期生成标准导出 |
 
 ## 支持范围与职责
 
@@ -68,171 +68,11 @@
 
 释放系统加载句柄（loader handle）不保证所有平台立即完成物理卸载（physical unloading）或重置静态状态（static state）。参见 [Windows `FreeLibrary`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary) 与 [POSIX `dlclose`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlclose.html)。若反复使用确实遇到当前无法可靠解决的保留状态问题，将依据真实证据讨论限制；目前没有采用“同版本仅能使用一次”的普遍限制。
 
-### 共享持有（shared holding）与释放责任
+## 选择接入方法
 
-共同对象合同及基础 Rust 接口（API）已经冻结。已提供的初始化输入通过受控 C 表关联同一宿主管理接口（host management interface）及同一初始化轮次。插件通过 Rust 封装取得原生终端与运行时的共享持有，以及本轮原生 `Config` 的所有权。
+宿主使用 `pi_ffi::host` 装入可信插件包，提供原生 P2P 终端、配置和可选运行时。载入前核对实际发布制品和依赖，保留原轮次句柄用于失败后的关闭。关闭完成并确认引用退出后，再显式释放本库的系统引用。 [宿主和手工封装示例](crates/pi_ffi/README.md)。
 
-本地克隆（Clone）共享一个拥有者；需要另一份独立持有（independent holding）时，必须显式取得。每份独立持有在对外交付前，宿主（host）就已登记剩余释放义务及所需代码保活。最后一个本地拥有者结束时，只提交这条已有记录；提交不临时分配记录，也不执行来源回调（source callback）。宿主（host）随后推进真实释放，最终失败保留在管理状态与关闭结果中。
-
-例如，最后一个本地拥有者销毁时，另一个线程仍在执行一次已经获准的调用：释放提交可以成功，但关闭仍须返回忙碌（Busy），直到该调用退出、真实清理完成。**提交成功、持有归还和清理完成分别判断。** 不能只依据 `Drop` 已执行就释放动态库（dynamic library）的代码映射（code mapping）。
-
-宿主可调用 `Manager::maintain` 有界推进已登记的释放。安全 Rust 也允许通过 `mem::forget` 跳过析构（Drop），因此遗忘拥有者可能延后卸载（unloading），不能强制清零来绕过它。依据为 [Rust 关于遗忘与安全的说明](https://doc.rust-lang.org/1.100.0/std/mem/fn.forget.html#safety)。
-
-析构（Drop）的提交路径只返回有限的 `pi_result` 分类投影，不创建新的错误报告（Report）。显式 `Object::release` 在最后一个本地拥有者需要提交时，再于允许分配的返回路径形成 `pi_result`；有其它本地别名时仅结束当前别名。最终清理是否完成，仍由宿主管理状态与关闭结果说明。
-
-### 首次取得管理接口时的错误
-
-首次查询失败时，接收方可能还没有建立管理连接（management connection）。标准来源必须在自身登记表内创建该次查询／`retain` 的错误诊断（diagnostic）；转发其它来源的错误时，先在本地转换为 `pi_result`，再生成自己的诊断。
-
-接入封装在原调用已经提供的代码与上下文（context）保护内，复制同一来源的诊断，再显式归还；这条归还路径不放入析构（Drop）。来源已经拥有自己的宿主连接，由它先提交该诊断预登记的释放记录，再确认归还。重复提交已有记录不增加任务，也不即时执行来源回调（source callback）。
-
-来源、上下文（context）或轮次不匹配的返回值按损坏（Corrupted）拒绝读取，不尝试解引用未经保护的地址。已有释放责任及代码持有保留，不能把拒绝读取当作已经完成清理。标准来源的代码保护、逐次访问核验与独立持有须同时满足；只检查指针非空并不充分。
-
-## 接入代码（Integration）
-
-将插件包装写在自己的 Rust 库中。用 `cdylib` 产出操作系统可装入的动态库（dynamic library）。两侧使用同一套配套构建（matching build），包括工具链（toolchain）、目标、Cargo 解算结果、分配器（allocator）、Rust 共享适配库及实际依赖。宿主用完整制品清单（build manifest）描述目标、稳定 UUID、完整版本、文件摘要、预期装入的依赖和静态声明归属。
-
-下列路径按仓库在磁盘上的实际位置调整。示例使用真实 P2P 终端类型，保留必传配置，省略运行时（runtime），静态集合为空。
-
-```toml
-[package]
-name = "example-plugin"
-version = "1.2.3"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-pi_ffi = { path = "../pi-ffi/crates/pi_ffi" }
-pi_result = { path = "../pi_result" }
-pi_p2p_service = { path = "../pi-p2p-service" }
-```
-
-### 手工封装（Manual wrapping）
-
-```rust
-use pi_ffi::{
-    abi::{
-        CloseFnV1, InitIdV1, InitReplyV1, InitializeFnV1, MetadataFnV1, MetadataV1, ObjectRefV1,
-        OutcomeV1,
-    },
-    plugin::{Declaration, Exports, Inputs},
-};
-use pi_p2p_service::P2pServiceTerminal;
-use pi_result::Result;
-
-type PluginInputs = Inputs<P2pServiceTerminal>;
-
-const DECLARATION: Declaration = Declaration {
-    uuid: [
-        0x29, 0x57, 0x00, 0x98, 0xaa, 0x48, 0x46, 0x8c,
-        0xb5, 0x12, 0x63, 0xc2, 0x6b, 0x24, 0xa9, 0x31,
-    ],
-    version: env!("CARGO_PKG_VERSION"),
-};
-
-static EXPORTS: Exports<PluginInputs> = Exports::new(DECLARATION);
-
-fn initialize(inputs: PluginInputs, state: &mut Option<PluginInputs>) -> Result<()> {
-    *state = Some(inputs);
-    Ok(())
-}
-
-fn close(state: &mut Option<PluginInputs>) -> Result<()> {
-    drop(state.take());
-    Ok(())
-}
-
-// 遵约宿主保活模块并提供独占的输出槽。
-#[unsafe(no_mangle)]
-unsafe extern "C" fn pi_ffi_metadata_v1(out: *mut MetadataV1) -> OutcomeV1 {
-    unsafe { EXPORTS.metadata(out) }
-}
-
-// 遵约宿主保活同一轮的输入至调用返回。
-#[unsafe(no_mangle)]
-unsafe extern "C" fn pi_ffi_initialize_v1(
-    runtime: *const ObjectRefV1,
-    terminal: *const ObjectRefV1,
-    config: *const ObjectRefV1,
-) -> InitReplyV1 {
-    unsafe { EXPORTS.initialize_without_runtime(runtime, terminal, config, initialize) }
-}
-
-// 遵约宿主保活模块，并按原轮次发出关闭请求。
-#[unsafe(no_mangle)]
-unsafe extern "C" fn pi_ffi_close_v1(id: InitIdV1) -> OutcomeV1 {
-    unsafe { EXPORTS.close(id, close) }
-}
-
-const _: MetadataFnV1 = pi_ffi_metadata_v1;
-const _: InitializeFnV1 = pi_ffi_initialize_v1;
-const _: CloseFnV1 = pi_ffi_close_v1;
-```
-
-保留所选 UUID 供后续版本使用。真实封装在产生资源或静态登记等效果前保留本轮可用于关闭的状态。关闭时按本轮记录停止接纳、撤回实际登记并等待相关引用按框架约定退出。清理尚未完成时通过 `pi_result` 返回 `Busy`，保留后续需要的状态。
-
-### 可选过程宏（Procedural macro）
-
-包装库可追加 `pi_ffi_macros = { path = "../pi-ffi/crates/pi_ffi_macros" }`。下面的调用使用上例的 `DECLARATION`、`PluginInputs`、`initialize` 和 `close`，替换 `static EXPORTS`、三个手工函数及函数指针声明。
-
-```rust
-pi_ffi_macros::export_plugin! {
-    declaration: DECLARATION,
-    state: PluginInputs,
-    initialize: initialize,
-    close: close,
-    runtime: none,
-}
-```
-
-有类型明确的可选运行时时用 `runtime: optional(MyRuntime)`，初始化函数接收 `Inputs<P2pServiceTerminal, MyRuntime>`。如果 Cargo 把 `pi_ffi` 改名为 `my_ffi`，加入 `api: ::my_ffi`。每份插件动态库使用一套手工入口或一次宏调用。
-
-### 宿主调用（Host calls）
-
-宿主使用实际构建记录调用 `PluginPackage::from_verified_build`。这个 `unsafe` 入口要求宿主已核实受信部署、配套构建与分配器，且文件和加载条件在约定的使用期间稳定。部署方有其真实构建记录后才使用下列装入和准备方法。宿主已有自己的终端及配置。创建 `TerminalInput` 时，宿主须确认双方配套构建使用同一原生终端类型、实际实例及其代码，并保活到最后使用和释放。只有此时才可调用 `unsafe { TerminalInput::new(terminal_arc) }`。后续准备方法接受这份已核实的终端输入。
-
-```rust
-use std::sync::Arc;
-
-use pi_ffi::{
-    config::Config,
-    host::{HostBuild, Initialization, Manager, Plugin, PluginPackage, PluginRequest, TerminalInput},
-    runtime::{IdleDispatch, RuntimeQuery, RuntimeWait},
-};
-use pi_p2p_service::P2pServiceTerminal;
-use pi_result::Result;
-
-pub fn prepare_example(
-    build: HostBuild,
-    package: &PluginPackage,
-    request: &PluginRequest,
-    terminal: TerminalInput<P2pServiceTerminal>,
-    config: Config,
-) -> Result<(Manager, Plugin, Initialization)> {
-    let manager = Manager::process(build)?;
-    let plugin = manager.load(package, request)?;
-    let round = plugin.prepare_without_runtime(terminal, config)?;
-    Ok((manager, plugin, round))
-}
-
-pub fn prepare_with_runtime<R>(
-    plugin: &Plugin,
-    terminal: TerminalInput<P2pServiceTerminal>,
-    config: Config,
-    runtime: Option<Arc<R>>,
-) -> Result<Initialization>
-where
-    R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
-{
-    plugin.prepare(terminal, config, runtime)
-}
-```
-
-宿主从 `plugin.metadata()` 读取自己的元信息副本。保存 `round` 后调用 `round.initialize()`。成功或失败都保留原轮的句柄（handle），关闭时调用 `round.close()`。进度尚未完成时保留本轮并根据实际 `pi_result` 推进；例如在合适时机调用 `manager.maintain(budget)` 推进已登记归还，再使用原轮次继续关闭。确认关闭成功后才显式调用 `plugin.unload()`。系统释放结果不明时，按错误报告保留占用和退出证据，只读宿主已有副本。
-
-省略运行时的插件用 `prepare_without_runtime`。另一份用 `initialize` 接受可选运行时的插件，可与 `prepare_with_runtime` 配套使用；每个已准备轮次固定原入参。
+包装库使用 Rust `cdylib`。手工接法用 `pi_ffi::plugin::Exports` 编写三个标准 C 导出，可选 `export_plugin!` 生成相同接线。一个插件产物提供一套导出。 [可选宏及示例](crates/pi_ffi_macros/README.md)。
 
 ## 恐慌（panic）策略与构建设置
 
@@ -319,13 +159,7 @@ Rust 库（Rust library）的链接（linking）兼容要求参见 [Rust 链接�
 
 ## `pi_result` 错误处理示例
 
-本库全部错误定义和处理使用 `pi_result`。跨外部函数接口（FFI）时采用已经冻结的宿主自有诊断数据副本（host-owned diagnostic copy）合同：来源方提取公共分类及 `user`／`verbose`／`debug` 三段 UTF-8 文本，宿主（host）复制并构造自己拥有的错误报告（error report），原报告（report）与原内存由创建方释放。来源内部可以暂存 `Pin<Box<pi_result::Error>>`，接收方不把该指针还原为本地原生错误。
-
-共同结果 `OutcomeV1` 只允许三种表示：成功时两个分类为零且诊断为空；操作失败时携带一个独立诊断；诊断本身无法建立时携带操作分类及诊断建立失败分类，诊断为空。未知非零分类映射为 `Other` 并保留原编号；矛盾表示按 `Corrupted` 处理。固定编号是成功 `0` 及以下依次对应 `1`—`17` 的分类：`InvalidInput`、`InvalidState`、`NotFound`、`AlreadyExists`、`Conflict`、`PermissionDenied`、`Io`、`Timeout`、`Cancelled`、`Busy`、`Unavailable`、`Unsupported`、`ResourceExhausted`、`Corrupted`、`Dependency`、`Internal`、`Other`。
-
-文本长度按 UTF-8 字节计数，不含结尾零字节；复制前检查总长度、整数转换和容量，成功写入量必须精确一致。读取或复制失败也必须交接已经接管的诊断释放责任，次级失败不能覆盖原操作分类。原始三段文本作为本地 `CopiedDiagnostic` 保留；本地报告格式会增加自己的上下文（context），不能用重新格式化代替原始文本。诊断无法建立时，不声称恢复未取得的文本或原生附件（native attachment）。
-
-原生 `ErrorReport`、`String`、`Vec`、`Arc` 或特征对象（trait object）不能直接当作稳定 C 表示返回；`ErrorKind` 的声明顺序也不能当作协议数字编码（protocol numeric encoding）。诊断复制不等于恢复原始 Rust 错误类型（error type）或任意不透明附件（opaque attachment）。
+Rust 接口用 `pi_result` 报告操作的实际失败。宿主可保存自己的诊断副本，在插件释放后继续读取。独立诊断可保存原来源的 `user`、`verbose`、`debug` 三段文本；诊断不能建立时，可从结果中得知操作与诊断失败的分类。 [错误接入与诊断用法](crates/pi_ffi_core/README.md)。
 
 可预期的失败直接通过 `pi_result::Result` 返回。恐慌（panic）捕获用于处理约定范围内的意外失败，不能代替正常错误处理。
 

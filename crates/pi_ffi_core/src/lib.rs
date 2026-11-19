@@ -1,6 +1,5 @@
 #![doc(html_no_source)]
-//! 受控对象交接（controlled object handoff）、诊断与来源生命周期。
-//! 标准C入口需要在其自身边界捕获可展开恐慌，不跨C展开。
+#![doc = include_str!("../README.md")]
 
 pub mod boundary;
 pub mod control;

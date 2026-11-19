@@ -1,4 +1,5 @@
-//! 可选的 Rust 插件动态库（plugin dynamic library）编译期接入。
+#![doc(html_no_source)]
+#![doc = include_str!("../README.md")]
 
 #[path = "lib_inner.rs"]
 mod inner;
