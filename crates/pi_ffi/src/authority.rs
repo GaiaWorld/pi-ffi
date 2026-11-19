@@ -61,7 +61,9 @@ struct State {
 
 struct ModuleRecord {
     epoch: u64,
-    files: Arc<VerifiedFiles>,
+    // 装入准备到明确结束期间保有实际文件。确认结束后移出记录持有。
+    files: Option<Arc<VerifiedFiles>>,
+    // 映像标识只在仍需要核对实际映像时保存。明确结束后清空。
     mapped: Option<MappedIdentity>,
     image: Option<Arc<VerifiedImage>>,
     library: Option<NativeModule>,
@@ -326,9 +328,14 @@ impl Authority {
         inner::authority_record_mapping(self, epoch, mapped)
     }
 
+    // 按本轮是否提供运行时（runtime）核对配套库，通过才登记本轮。
     // @trace 6
-    pub(crate) fn reserve_round(&'static self, epoch: u64) -> Result<(InitIdV1, Connection)> {
-        inner::authority_reserve_round(self, epoch)
+    pub(crate) fn reserve_round(
+        &'static self,
+        epoch: u64,
+        has_runtime: bool,
+    ) -> Result<(InitIdV1, Connection)> {
+        inner::authority_reserve_round(self, epoch, has_runtime)
     }
 
     // @trace 7

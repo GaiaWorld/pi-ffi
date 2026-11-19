@@ -77,7 +77,7 @@ where
     T: Send + Sync + 'static,
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
 {
-    todo!("先核批准的配套 Rust 依赖。预登记本轮和占用，建立实际共同连接。按 B2—B4 装包，每项只登记一次。失败进入明确的宿主归还路径。")
+    todo!("把本轮实际有无运行时交给 Authority::reserve_round。取得已核配套、已登记本轮的连接后，按 B2—B4 装包，每项只登记一次。登记后的失败进入明确的宿主归还路径。")
 }
 
 pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static>(
@@ -85,7 +85,7 @@ pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static>(
     terminal: TerminalInput<T>,
     config: Config,
 ) -> Result<Initialization> {
-    todo!("沿同一轮次准备逻辑，省略运行时装包及运行时输入专有核验。")
+    todo!("沿同一轮次准备逻辑，将无运行时传给 Authority::reserve_round。获得连接后只登记配置和终端。")
 }
 
 pub(super) fn plugin_current_initialization(plugin: &Plugin) -> Result<Option<Initialization>> {

@@ -32,14 +32,15 @@ pub(super) fn authority_reserve_load(
     authority: &'static Authority,
     files: Arc<VerifiedFiles>,
 ) -> Result<LoadAdmission> {
-    todo!("按实际文件登记即将装入的唯一记录，同文件复用前先核新清单的 UUID 和完整版本、构建及已核宿主元信息一致；实际请求再经 host 核对。尚在执行或结果不确定时返回相应失败。")
+    todo!("按实际文件登记即将装入的唯一记录并保存实际文件持有。仅用仍有效的文件记录核对同文件复用。复用前核新清单的 UUID 和完整版本、构建及已核宿主元信息。实际请求再经 host 核对。尚在执行或结果不确定时返回相应失败。")
 }
 
 pub(super) fn authority_reserve_round(
     authority: &'static Authority,
     epoch: u64,
+    has_runtime: bool,
 ) -> Result<(InitIdV1, Connection)> {
-    todo!("同锁比较已验证 UUID 和完整版本，准备唯一新轮。锁外用稳定的两项管理视图建立本地 Connection，失败保留实际已发生准备处置。")
+    todo!("短锁内核模块已装入并取同一份只读映像资料。锁外按 has_runtime 核实际配套库。检查期间插件可以退出。插件映像标识仅用于比较，查询只用当前系统枚举、实际文件和宿主持有的适配库地址。通过后以原模块代际、同一资料和已装入状态重新核对。同锁比较 UUID、完整版本和占用，准备唯一新轮。锁外用稳定的两项管理视图建立本地 Connection。此前检查失败不登记本轮及输入，登记后的失败保留实际已发生准备处置。")
 }
 
 pub(super) fn authority_publish_inputs(
@@ -184,16 +185,16 @@ pub(super) fn system_confirm_loaded(
     image: VerifiedImage,
     metadata: Metadata,
 ) -> Result<ModuleView> {
-    todo!("先完成发布所需准备。新模块将持有原子登记。已知实际同模块匹配时显式归还额外引用，再交付复用入口。错误由原装入记录接受。")
+    todo!("先完成发布所需准备。新模块将持有原子登记。已知实际同模块匹配时显式归还额外引用。确认额外引用归还后，结束候选记录、清空其旧映像标识并在锁外放掉文件和映像资料，再交付复用入口。错误由原装入记录接受。")
 }
 
 pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
-    todo!("已取得引用则明确尝试一次释放；未尝试或已确定无引用时按实际处理。保留原错误和真实结果。释放不明时隔离已知同映像记录及候选版本。")
+    todo!("已取得引用则明确尝试一次释放。未尝试或已确定无引用时按实际处理。保留原错误和真实结果。确认无系统引用时清空旧映像标识并从记录移出文件及映像资料，在锁外归还。释放不明时隔离已知同映像记录及候选版本，禁止使用相关旧地址。")
 }
 
 pub(super) fn system_release(operation: SystemOperation) -> Result<()> {
-    todo!("标准卸载的唯一释放入口。锁外消费真实引用，结果马上记入保留的记录。失败或不明时禁止使用相关旧地址，保留占用和诊断。")
+    todo!("标准卸载的唯一释放入口。锁外消费真实引用并记录结果。确认释放成功时锁内清空旧映像标识，移出该记录的文件和映像资料，锁外结束它们的持有。保留原模块编号和已有结果供重放。失败或不明时禁止使用相关旧地址，保留占用和诊断。")
 }
 pub(super) fn system_operation_drop(operation: &mut SystemOperation) {
-    todo!("在原登记中无分配归回仍明确拥有的引用，待显式维护；已进入系统调用但结果不明时隔离且不再调用旧地址。确认完成则只结束本地记录。")
+    todo!("在原登记中无分配归回仍明确拥有的引用，待显式维护。系统调用结果不明时保留原记录和占用，停用旧地址。已经确认无引用时只结束本地操作，实际文件和映像资料的持有按已确认分支在锁外结束。")
 }
