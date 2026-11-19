@@ -68,7 +68,7 @@ pub(crate) struct Binding {
     /// 本地登记所用管理地址；由protection保持存续。
     pub(crate) management: ManagementAddress,
     /// 查询时交给接收方的受限上下文；宿主自身登记能力不得直接泄露给插件。
-    pub(crate) forwarded_management: ManagementAddress,
+    forwarded_management: ManagementAddress,
     /// 本连接唯一初始化作用域，不能以字段复制建立新轮。
     pub(crate) initialization: InitIdV1,
     /// 管理代码及上下文的唯一保活来源。
@@ -217,6 +217,14 @@ impl Connection {
     // @trace 17
     pub(crate) fn retire_raw(&self, source: u64, operation: OperationIdV1) -> OutcomeV1 {
         inner::connection_retire_raw(self, source, operation)
+    }
+
+    // 仅用于同轮来源的管理表查询。来源先核请求及持有、退出来源锁，
+    // 并在本次调用保护下取值。只复制 Live 连接的受限表及上下文，
+    // 无独立持有；调用方继续使用时按共同合同取得保护。
+    // @trace 22
+    pub(crate) fn forwarded_view(&self) -> Result<pi_ffi_abi::InterfaceViewV1> {
+        inner::connection_forwarded_view(self)
     }
 }
 

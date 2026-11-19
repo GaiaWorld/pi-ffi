@@ -75,3 +75,9 @@ pub(super) fn call_finish(mut receiver: Call) -> Result<()> {
 pub(super) fn call_drop(receiver: &mut Call) {
     todo!("输入（input）：self；本地步骤（local steps）：尚未结束时归还既有调用标识；失败由宿主持续记录；不分配新责任，不直接卸载来源；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
 }
+
+pub(super) fn connection_forwarded_view(
+    receiver: &Connection,
+) -> Result<pi_ffi_abi::InterfaceViewV1> {
+    todo!("核本连接的 Live 状态并复制本轮受限管理视图，失败返回 pi_result。")
+}

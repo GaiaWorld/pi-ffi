@@ -95,8 +95,9 @@ pub(super) unsafe fn query_interface(
     lease: LeaseV1,
     request: InterfaceRequestV1,
     out: *mut InterfaceViewV1,
+    forwarded_view: fn(&Connection) -> Result<InterfaceViewV1>,
 ) -> OutcomeV1 {
-    todo!("输入（input）：context, lease, request, out；本地步骤（local steps）：在保护内核lease和固定请求；只在成功写出借用context及表；管理表仅返回同轮受限管理能力，不泄露宿主内部能力；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
+    todo!("输入（input）：context, lease, request, out, forwarded_view；本地步骤（local steps）：在保护内核持有及固定请求；仅准确管理表请求在来源锁已退后调用 forwarded_view；只在成功写出受原持有约束的借用上下文及表；输出（output）：签名约定的结果；边界（boundary）：状态由本来源或宿主分别拥有；验证（verification）：合法调用链覆盖正常、拒绝、重复、恐慌与清理失败。")
 }
 
 pub(super) unsafe fn diagnostic_info(

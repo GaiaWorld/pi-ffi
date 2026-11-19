@@ -519,6 +519,8 @@ pub(crate) unsafe extern "C" fn release(
     )
 }
 // 本地步骤（local steps）：在保护内核lease和固定请求；只在成功写出借用context及表；管理表仅返回同轮受限管理能力，不泄露宿主内部能力。
+// 管理表查询结束来源短锁后，经 Connection::forwarded_view 取得同轮受限视图。
+// 现有来源调用保护覆盖读取及写出；借用视图使用仍依共同调用合同。
 // @trace 38
 pub(crate) unsafe extern "C" fn query_interface(
     context: *mut core::ffi::c_void,
@@ -533,7 +535,9 @@ pub(crate) unsafe extern "C" fn query_interface(
             round: lease.initialization.round,
             source: lease.object.source,
         },
-        || unsafe { inner::query_interface(context, lease, request, out) },
+        || unsafe {
+            inner::query_interface(context, lease, request, out, Connection::forwarded_view)
+        },
     )
 }
 // 本地步骤（local steps）：核一次独立诊断持有；写出不可变分类及三段UTF-8字节数；失败不承诺输出值。
