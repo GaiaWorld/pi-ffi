@@ -72,11 +72,14 @@ pub(super) unsafe fn package_from_verified_unloadable_build(
     root: PathBuf,
     manifest: BuildManifest,
 ) -> Result<PluginPackage> {
-    todo!("沿可信部署路径核对和原错误处理。成功后只为此包确定可提前卸载的选择，再交付；过程中不装入系统模块。")
+    // 安全前提（safety）。提前卸载的调用方同时满足可信配套构建（matching build）的前提。
+    let mut package = unsafe { PluginPackage::from_verified_build(root, manifest) }?;
+    package.unload_policy = UnloadPolicy::ReleaseWhenQuiescent;
+    Ok(package)
 }
 
 pub(super) fn package_unload_policy(package: &PluginPackage) -> UnloadPolicy {
-    todo!("只读取本包建立时绑定的卸载选择，保持 Clone 后的一致性。")
+    package.unload_policy
 }
 
 pub(super) fn package_root(package: &PluginPackage) -> &Path {

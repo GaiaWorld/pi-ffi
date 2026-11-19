@@ -1,5 +1,5 @@
 use super::*;
-use crate::loader;
+use crate::{loader, package::UnloadPolicy};
 use pi_ffi_abi::{
     InterfaceViewV1, MaintenanceV1, SourceControlApiV1, SOURCE_CONTROL_MAJOR, TARGET_DIAGNOSTIC,
     TARGET_OBJECT,
@@ -46,13 +46,38 @@ pub(super) fn authority_reserve_load(
     let identity = files.identity();
     let admission = {
         let mut state = authority.state.lock();
-        if let Some(record) = state.modules.iter().find(|record| {
-            record
-                .files
-                .as_ref()
-                .is_some_and(|current| current.identity() == identity)
-        }) {
+        if let Some(record) = record_for_file(&state, identity) {
             reuse_snapshot(record).map(LoadSelection::Reuse)
+        } else if let Some(retained) = state
+            .retained_images
+            .iter()
+            .find(|retained| retained.deployment.identity() == identity)
+        {
+            match retained.phase {
+                RetentionPhase::Held(_) => {
+                    if let Some(other) = quarantined_mapping(&state, retained.mapped, 0) {
+                        Err(module_unavailable(other))
+                    } else {
+                        Ok(LoadSelection::Retained(RetainedSnapshot {
+                            retired_epoch: retained.retired_epoch,
+                            mapped: retained.mapped,
+                            deployment: Arc::clone(&retained.deployment),
+                        }))
+                    }
+                }
+                RetentionPhase::Retiring => {
+                    let failure = state
+                        .modules
+                        .iter()
+                        .find(|record| {
+                            record.epoch == retained.retired_epoch
+                                && matches!(record.phase, ModulePhase::Quarantined)
+                        })
+                        .map_or((ErrorKind::Busy, None), module_unavailable);
+                    Err(failure)
+                }
+                RetentionPhase::Revalidating { .. } => Err((ErrorKind::Busy, None)),
+            }
         } else {
             reserve_load_record(authority, &mut state, &files, &fallback).map(LoadSelection::New)
         }
@@ -65,6 +90,24 @@ pub(super) fn authority_reserve_load(
             recheck_reuse(authority, &original)?;
             Ok(LoadAdmission::Reuse(original.view))
         }
+        LoadSelection::Retained(original) => {
+            if !original.deployment.matches_reuse(&files) {
+                return Err(module_error(
+                    ErrorKind::Conflict,
+                    "match retained plugin deployment",
+                    None,
+                ));
+            }
+            let operation = {
+                let mut state = authority.state.lock();
+                reserve_retained_load(authority, &mut state, &files, &original, &fallback)
+            };
+            operation
+                .map(LoadAdmission::New)
+                .map_err(|(kind, failure)| {
+                    module_error(kind, "reserve retained plugin reuse", failure)
+                })
+        }
     }
 }
 
@@ -75,7 +118,10 @@ pub(super) fn authority_reserve_round(
 ) -> Result<(InitIdV1, Connection)> {
     let image = {
         let state = authority.state.lock();
-        ready_for_prepare(&state, epoch).map(|(image, _)| Arc::clone(image))
+        ready_for_prepare(&state, epoch).and_then(|(image, metadata)| {
+            check_quarantined_version(&state, metadata)?;
+            Ok(Arc::clone(image))
+        })
     }
     .map_err(|(kind, failure)| {
         module_error(kind, "check initialization input libraries", failure)
@@ -609,9 +655,23 @@ pub(super) fn system_open(operation: &mut SystemOperation) -> Result<()> {
             None,
         ));
     }
-    let files = operation.files.as_deref().ok_or_else(|| {
-        module_error(ErrorKind::Corrupted, "read reserved module files", None)
-    })?;
+    if matches!(operation.purpose, SystemPurpose::Revalidate { .. })
+        && operation.library.is_some()
+        && operation.files.is_some()
+    {
+        // 保留映像（retained image）已有同一系统引用，只开始当前核验。
+        operation.phase = SystemPhase::OwnsReference;
+        return Ok(());
+    }
+    let Some(files) = operation.files.as_deref().filter(|_| {
+        matches!(operation.purpose, SystemPurpose::Load) && operation.library.is_none()
+    }) else {
+        return Err(module_error(
+            ErrorKind::Corrupted,
+            "read reserved module files",
+            None,
+        ));
+    };
     operation.phase = SystemPhase::Opening;
     match loader::open(files) {
         Ok(module) => {
@@ -642,7 +702,23 @@ pub(super) fn system_record_metadata(
     operation: &SystemOperation,
     metadata: &Metadata,
 ) -> Result<()> {
-    todo!("只接受拥有实际引用且映像归属已经核实的本次装入操作。在锁外准备宿主元信息副本，短锁内校验原代仍在装入中且映像匹配，再保存完整 UUID 和版本。接受相同值的重放；不同值报告 Conflict。锁外结束未采用副本。此记录不授予调用许可。")
+    if !matches!(
+        operation.purpose,
+        SystemPurpose::Load | SystemPurpose::Revalidate { .. }
+    ) {
+        return Err(module_error(
+            ErrorKind::InvalidState,
+            "record mapped metadata",
+            None,
+        ));
+    }
+    let mapped = loader::mapped_identity(operation.library()?)?;
+    let metadata = Arc::new(metadata.clone());
+    let saved = {
+        let mut state = operation.authority.state.lock();
+        save_loaded_metadata(&mut state, operation, mapped, &metadata)
+    };
+    saved.map_err(|(kind, failure)| module_error(kind, "record mapped metadata", failure))
 }
 
 pub(super) fn system_confirm_loaded(
@@ -652,26 +728,35 @@ pub(super) fn system_confirm_loaded(
 ) -> Result<ModuleView> {
     let mut operation = operation;
     let authority = operation.authority;
-    let epoch = operation.epoch;
     let image = Arc::new(image);
-    let metadata = Arc::new(metadata);
     let confirmation = {
         let mut state = operation.authority.state.lock();
         publish_loaded(&mut state, &mut operation, &image, &metadata)
     };
     match confirmation {
-        Ok(LoadConfirmation::Published(obsolete_failure)) => {
-            drop(obsolete_failure);
-            Ok(ModuleView { epoch, metadata })
+        Ok(LoadConfirmation::Published {
+            view,
+            fallback,
+            retained,
+        }) => {
+            drop((fallback, retained));
+            Ok(view)
         }
         Ok(LoadConfirmation::Reuse(original)) => {
             let Some(files) = operation.files.as_deref() else {
                 let failure = module_error(ErrorKind::Corrupted, "read reserved module files", None);
                 return Err(operation.reject(failure));
             };
-            if let Err(failure) = compare_reuse(&original, files) {
+            if let Err(failure) =
+                compare_reuse(&original, files).and_then(|()| recheck_reuse(authority, &original))
+            {
                 return Err(operation.reject(failure));
             }
+            // 原代的映像（mapped image）和文件借用须持续到额外引用实际归还并记录结果。
+            operation.purpose = SystemPurpose::ReturnDuplicate {
+                original_epoch: original.view.epoch,
+            };
+            drop(image);
             operation.release()?;
             recheck_reuse(authority, &original)?;
             Ok(original.view)
@@ -685,15 +770,9 @@ pub(super) fn system_confirm_loaded(
 pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
     let mut operation = operation;
     match operation.phase {
-        SystemPhase::OwnsReference => {
-            let original = Arc::new(cause);
-            let failure = replay_module_failure(Arc::clone(&original), "reject native load");
-            match release_reference(&mut operation, Some(original)) {
-                Ok(()) => failure,
-                Err(release_failure) => failure.attach(RecordedFailure(Arc::new(release_failure))),
-            }
-        }
-        SystemPhase::Reserved => {
+        SystemPhase::Reserved
+            if matches!(operation.purpose, SystemPurpose::Load) && operation.library.is_none() =>
+        {
             let original = Arc::new(cause);
             confirm_no_reference(&mut operation, Some(Arc::clone(&original)));
             replay_module_failure(original, "reject native load")
@@ -702,48 +781,99 @@ pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
             Ok(()) => cause,
             Err(failure) => cause.attach(RecordedFailure(Arc::new(failure))),
         },
-        SystemPhase::Opening | SystemPhase::ReleasingReference => {
+        SystemPhase::Finished => cause,
+        _ => {
             let original = Arc::new(cause);
             quarantine_mapping(&mut operation, Some(Arc::clone(&original)));
-            replay_module_failure(original, "unconfirmed native result")
+            replay_module_failure(original, "reject native load")
         }
-        SystemPhase::Finished => cause,
     }
 }
 
 pub(super) fn system_release(operation: SystemOperation) -> Result<()> {
     let mut operation = operation;
-    release_reference(&mut operation, None)
+    match operation.phase {
+        SystemPhase::ReleaseConfirmed => return operation.finish_confirmed_release(),
+        SystemPhase::OwnsReference => {}
+        _ => {
+            return Err(module_error(
+                ErrorKind::InvalidState,
+                "release native reference",
+                None,
+            ))
+        }
+    }
+    if matches!(operation.purpose, SystemPurpose::Retire)
+        && operation
+            .files
+            .as_ref()
+            .is_some_and(|files| files.unload_policy() == UnloadPolicy::RetainUntilExit)
+    {
+        retain_reference(&mut operation)
+    } else {
+        release_reference(&mut operation)
+    }
 }
 
 pub(super) fn system_finish_confirmed_release(operation: &mut SystemOperation) -> Result<()> {
-    todo!("仅处理原 SystemOperation 的 ReleaseConfirmed。确认归还事实和原用途，不再调用加载器。在短锁内移出本操作及对应记录的核验文件和映像资料，锁外归还所有持有，回锁确认该代结束。若原登记不相符，保存已确认的系统结果和本地失败，停用该记录的地址。成功仅发布一次，重放保持结果。")
-}
-
-fn release_reference(
-    operation: &mut SystemOperation,
-    released_failure: Option<Arc<Error>>,
-) -> Result<()> {
-    if !matches!(operation.phase, SystemPhase::OwnsReference) {
+    if !matches!(operation.phase, SystemPhase::ReleaseConfirmed) {
         return Err(module_error(
             ErrorKind::InvalidState,
-            "release native reference",
+            "finish confirmed native release",
             None,
         ));
     }
-    let Some(module) = operation.library.take() else {
-        quarantine_mapping(operation, None);
-        return Err(module_error(
-            ErrorKind::Corrupted,
-            "release native reference",
-            None,
-        ));
+    let materials = {
+        let mut state = operation.authority.state.lock();
+        confirmed_release_record(&mut state, operation)
+            .map(|record| take_verification(record, operation))
     };
-    operation.phase = SystemPhase::ReleasingReference;
+    match materials {
+        Ok(materials) => drop(materials),
+        Err(failure) => return Err(keep_confirmed_release_failure(operation, failure)),
+    }
+
+    let complete = {
+        let mut state = operation.authority.state.lock();
+        confirmed_release_record(&mut state, operation).and_then(|record| {
+            if record.files.is_some() || record.image.is_some() || operation.files.is_some() {
+                return Err((ErrorKind::Corrupted, None));
+            }
+            record.phase = ModulePhase::Released;
+            operation.phase = SystemPhase::Finished;
+            Ok(record.failure.take())
+        })
+    };
+    match complete {
+        Ok(fallback) => {
+            drop(fallback);
+            Ok(())
+        }
+        Err(failure) => Err(keep_confirmed_release_failure(operation, failure)),
+    }
+}
+
+fn release_reference(operation: &mut SystemOperation) -> Result<()> {
+    let started = {
+        let mut state = operation.authority.state.lock();
+        start_reference_release(&mut state, operation)
+    };
+    let module = match started {
+        Ok(module) => module,
+        Err((kind, previous)) => {
+            let failure = Arc::new(module_error(
+                kind,
+                "reserve system reference release",
+                previous,
+            ));
+            quarantine_mapping(operation, Some(Arc::clone(&failure)));
+            return Err(replay_module_failure(failure, "release native reference"));
+        }
+    };
     match loader::close(module) {
         Ok(()) => {
-            confirm_no_reference(operation, released_failure);
-            Ok(())
+            operation.phase = SystemPhase::ReleaseConfirmed;
+            operation.finish_confirmed_release()
         }
         Err(failure) => {
             let failure = Arc::new(failure);
@@ -755,33 +885,24 @@ fn release_reference(
 pub(super) fn system_operation_drop(operation: &mut SystemOperation) {
     match operation.phase {
         SystemPhase::Finished => {}
-        SystemPhase::Reserved => confirm_no_reference(operation, None),
-        SystemPhase::Opening | SystemPhase::ReleasingReference => {
-            quarantine_mapping(operation, None);
+        SystemPhase::Reserved
+            if matches!(operation.purpose, SystemPurpose::Load) && operation.library.is_none() =>
+        {
+            confirm_no_reference(operation, None)
         }
         SystemPhase::ReleaseConfirmed => {
             // 原记录仍保存归还确认。补完资料及记录步骤，失败也保存在原记录。
             drop(operation.finish_confirmed_release());
         }
-        SystemPhase::OwnsReference => {
-            let mut state = operation.authority.state.lock();
-            if let Some(record) = state
-                .modules
-                .iter_mut()
-                .find(|record| record.epoch == operation.epoch)
-            {
-                if record.library.is_none() && operation.library.is_some() {
-                    record.library = operation.library.take();
-                    if !matches!(record.phase, ModulePhase::Quarantined) {
-                        record.phase = ModulePhase::AwaitingRelease;
-                    }
-                    operation.phase = SystemPhase::Finished;
-                    return;
-                }
+        SystemPhase::OwnsReference if matches!(operation.purpose, SystemPurpose::Retire) => {
+            if operation.files.is_none() {
+                // 核验资料（verification material）是退役函数的局部值，先于系统操作析构。
+                drop(finish_retention(operation));
+            } else if !restore_retirement(operation, ModulePhase::AwaitingRelease) {
+                quarantine_mapping(operation, None);
             }
-            drop(state);
-            quarantine_mapping(operation, None);
         }
+        _ => quarantine_mapping(operation, None),
     }
 }
 
@@ -844,6 +965,13 @@ fn module_unavailable(record: &ModuleRecord) -> ModuleFailure {
 enum LoadSelection {
     New(SystemOperation),
     Reuse(ReuseSnapshot),
+    Retained(RetainedSnapshot),
+}
+
+struct RetainedSnapshot {
+    retired_epoch: u64,
+    mapped: MappedIdentity,
+    deployment: Arc<VerifiedDeployment>,
 }
 
 struct ReuseSnapshot {
@@ -865,7 +993,7 @@ fn reuse_snapshot(record: &ModuleRecord) -> std::result::Result<ReuseSnapshot, M
     ) else {
         return Err((ErrorKind::Corrupted, None));
     };
-    if mapped != image.identity {
+    if mapped != image.identity || !image.shares_files(files) {
         return Err((ErrorKind::Corrupted, None));
     }
     Ok(ReuseSnapshot {
@@ -935,6 +1063,28 @@ fn recheck_reuse(authority: &Authority, original: &ReuseSnapshot) -> Result<()> 
     enrolled.map_err(|(kind, failure)| module_error(kind, "recheck loaded plugin reuse", failure))
 }
 
+fn record_for_file(state: &State, identity: loader::FileIdentity) -> Option<&ModuleRecord> {
+    state
+        .modules
+        .iter()
+        .filter(|record| {
+            record
+                .files
+                .as_ref()
+                .is_some_and(|files| files.identity() == identity)
+        })
+        .min_by_key(|record| !matches!(record.phase, ModulePhase::Quarantined))
+}
+
+fn quarantined_mapping(state: &State, mapped: MappedIdentity, epoch: u64) -> Option<&ModuleRecord> {
+    state.modules.iter().find(|record| {
+        record.epoch != epoch
+            && matches!(record.phase, ModulePhase::Quarantined)
+            && record.library.is_some()
+            && record.mapped == Some(mapped)
+    })
+}
+
 fn reserve_load_record(
     authority: &'static Authority,
     state: &mut State,
@@ -966,6 +1116,53 @@ fn reserve_load_record(
     })
 }
 
+fn reserve_retained_load(
+    authority: &'static Authority,
+    state: &mut State,
+    files: &Arc<VerifiedFiles>,
+    original: &RetainedSnapshot,
+    fallback: &Arc<Error>,
+) -> std::result::Result<SystemOperation, ModuleFailure> {
+    if let Some(other) = record_for_file(state, files.identity()) {
+        let failure = if matches!(other.phase, ModulePhase::Quarantined) {
+            module_unavailable(other)
+        } else {
+            (ErrorKind::Busy, None)
+        };
+        return Err(failure);
+    }
+    let position = state
+        .retained_images
+        .iter()
+        .position(|retained| {
+            retained.retired_epoch == original.retired_epoch
+                && retained.mapped == original.mapped
+                && Arc::ptr_eq(&retained.deployment, &original.deployment)
+                && matches!(retained.phase, RetentionPhase::Held(_))
+        })
+        .ok_or((ErrorKind::Busy, None))?;
+    if let Some(other) = quarantined_mapping(state, original.mapped, 0) {
+        return Err(module_unavailable(other));
+    }
+
+    let mut operation = reserve_load_record(authority, state, files, fallback)?;
+    let retained = &mut state.retained_images[position];
+    // 已在同一短锁（short lock）确认 Held，同时预留了新代和文件持有。
+    let RetentionPhase::Held(library) = std::mem::replace(
+        &mut retained.phase,
+        RetentionPhase::Revalidating {
+            epoch: operation.epoch,
+        },
+    ) else {
+        unreachable!();
+    };
+    operation.purpose = SystemPurpose::Revalidate {
+        retired_epoch: original.retired_epoch,
+    };
+    operation.library = Some(library);
+    Ok(operation)
+}
+
 fn record_mapping(
     state: &mut State,
     epoch: u64,
@@ -983,18 +1180,60 @@ fn record_mapping(
         return Err((ErrorKind::Corrupted, None));
     }
     record.mapped = Some(mapped);
-    if let Some(other) = state.modules.iter().find(|record| {
-        record.epoch != epoch
-            && record.mapped == Some(mapped)
-            && matches!(record.phase, ModulePhase::Quarantined)
-    }) {
+    if let Some(other) = quarantined_mapping(state, mapped, epoch) {
         return Err(module_unavailable(other));
+    }
+    for retained in &state.retained_images {
+        if matches!(retained.phase, RetentionPhase::Revalidating { epoch: new } if new == epoch) {
+            if retained.mapped != mapped {
+                return Err((ErrorKind::Conflict, None));
+            }
+        } else if retained.mapped == mapped {
+            return Err((ErrorKind::Busy, None));
+        }
     }
     Ok(())
 }
 
+fn save_loaded_metadata(
+    state: &mut State,
+    operation: &SystemOperation,
+    mapped: MappedIdentity,
+    metadata: &Arc<Metadata>,
+) -> std::result::Result<(), ModuleFailure> {
+    let record = state
+        .modules
+        .iter_mut()
+        .find(|record| record.epoch == operation.epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    if !matches!(record.phase, ModulePhase::Loading) {
+        return Err(module_unavailable(record));
+    }
+    if record.mapped != Some(mapped)
+        || !record
+            .files
+            .as_ref()
+            .zip(operation.files.as_ref())
+            .is_some_and(|(record, operation)| Arc::ptr_eq(record, operation))
+    {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    match &record.metadata {
+        Some(previous) if **previous != **metadata => Err((ErrorKind::Conflict, None)),
+        Some(_) => Ok(()),
+        None => {
+            record.metadata = Some(Arc::clone(metadata));
+            Ok(())
+        }
+    }
+}
+
 enum LoadConfirmation {
-    Published(Option<Arc<Error>>),
+    Published {
+        view: ModuleView,
+        fallback: Option<Arc<Error>>,
+        retained: Option<RetainedImage>,
+    },
     Reuse(ReuseSnapshot),
 }
 
@@ -1002,7 +1241,7 @@ fn publish_loaded(
     state: &mut State,
     operation: &mut SystemOperation,
     image: &Arc<VerifiedImage>,
-    metadata: &Arc<Metadata>,
+    metadata: &Metadata,
 ) -> std::result::Result<LoadConfirmation, ModuleFailure> {
     let epoch = operation.epoch;
     let index = state
@@ -1016,27 +1255,67 @@ fn publish_loaded(
     }
     if record.mapped != Some(image.identity)
         || !matches!(operation.phase, SystemPhase::OwnsReference)
+        || !record
+            .files
+            .as_ref()
+            .zip(operation.files.as_ref())
+            .is_some_and(|(record, operation)| {
+                Arc::ptr_eq(record, operation) && image.shares_files(record)
+            })
     {
         return Err((ErrorKind::Corrupted, None));
     }
+    let Some(actual) = &record.metadata else {
+        return Err((ErrorKind::Corrupted, None));
+    };
+    if actual.as_ref() != metadata {
+        return Err((ErrorKind::Conflict, None));
+    }
+    let retained = match operation.purpose {
+        SystemPurpose::Load => None,
+        SystemPurpose::Revalidate { retired_epoch } => {
+            let index = revalidation_position(state, retired_epoch, epoch)
+                .ok_or((ErrorKind::Corrupted, None))?;
+            if state.retained_images[index].mapped != image.identity {
+                return Err((ErrorKind::Conflict, None));
+            }
+            Some(index)
+        }
+        _ => return Err((ErrorKind::InvalidState, None)),
+    };
     if let Some(other) = state.modules.iter().find(|record| {
         record.epoch != epoch
             && record.mapped == Some(image.identity)
             && !matches!(record.phase, ModulePhase::Loading | ModulePhase::Released)
     }) {
-        return reuse_snapshot(other).map(LoadConfirmation::Reuse);
+        return if retained.is_none() {
+            reuse_snapshot(other).map(LoadConfirmation::Reuse)
+        } else {
+            Err((ErrorKind::Conflict, None))
+        };
     }
     let library = operation
         .library
         .take()
         .ok_or((ErrorKind::Corrupted, None))?;
+    let metadata = Arc::clone(actual);
     let record = &mut state.modules[index];
     record.image = Some(Arc::clone(image));
-    record.metadata = Some(Arc::clone(metadata));
     record.library = Some(library);
     record.phase = ModulePhase::Loaded;
     operation.phase = SystemPhase::Finished;
-    Ok(LoadConfirmation::Published(record.failure.take()))
+    Ok(LoadConfirmation::Published {
+        view: ModuleView { epoch, metadata },
+        fallback: record.failure.take(),
+        retained: retained.map(|index| state.retained_images.swap_remove(index)),
+    })
+}
+
+fn revalidation_position(state: &State, retired_epoch: u64, epoch: u64) -> Option<usize> {
+    state.retained_images.iter().position(|retained| {
+        retained.retired_epoch == retired_epoch
+            && matches!(retained.phase, RetentionPhase::Revalidating { epoch: current } if current == epoch)
+    })
 }
 
 fn prepare_unload_record(
@@ -1073,12 +1352,20 @@ fn prepare_unload_record(
     {
         return Err((ErrorKind::Busy, None));
     }
-    if record.failure.is_some() {
+    if record.failure.is_some() || record.library.is_none() {
         return Err((ErrorKind::Corrupted, None));
     }
-    let Some(files) = record.files.clone() else {
+    let (Some(files), Some(image), Some(mapped)) = (&record.files, &record.image, record.mapped)
+    else {
         return Err((ErrorKind::Corrupted, None));
     };
+    if !image.shares_files(files) || image.identity != mapped {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    // 此锁也守所有借用（borrow）的取得。唯一映像和两份文件持有属于本代。
+    if Arc::strong_count(image) != 1 || Arc::strong_count(files) != 2 {
+        return Err((ErrorKind::Busy, None));
+    }
     let Some(library) = record.library.take() else {
         return Err((ErrorKind::Corrupted, None));
     };
@@ -1087,14 +1374,313 @@ fn prepare_unload_record(
     Ok(Some(SystemOperation {
         authority,
         epoch,
-        files: Some(files),
+        files: Some(Arc::clone(files)),
         purpose: SystemPurpose::Retire,
         phase: SystemPhase::OwnsReference,
         library: Some(library),
     }))
 }
 
-fn confirm_no_reference(operation: &mut SystemOperation, result: Option<Arc<Error>>) {
+fn start_reference_release(
+    state: &mut State,
+    operation: &mut SystemOperation,
+) -> std::result::Result<NativeModule, ModuleFailure> {
+    if !matches!(operation.phase, SystemPhase::OwnsReference) {
+        return Err((ErrorKind::InvalidState, None));
+    }
+    let index = state
+        .modules
+        .iter()
+        .position(|record| record.epoch == operation.epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    let record = &state.modules[index];
+    let mapped = record.mapped.ok_or((ErrorKind::Corrupted, None))?;
+    if record.library.is_some() || !operation_shares_files(record, operation) {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    match operation.purpose {
+        SystemPurpose::Retire => {
+            if !matches!(record.phase, ModulePhase::Unloading) {
+                return Err(module_unavailable(record));
+            }
+            if !keeps_verified_image(record, mapped) {
+                return Err((ErrorKind::Corrupted, None));
+            }
+        }
+        SystemPurpose::ReturnDuplicate { original_epoch } => {
+            if !matches!(record.phase, ModulePhase::Loading) {
+                return Err(module_unavailable(record));
+            }
+            let protected = state.modules.iter().any(|original| {
+                original.epoch == original_epoch
+                    && matches!(original.phase, ModulePhase::Loaded)
+                    && original.library.is_some()
+                    && original.mapped == Some(mapped)
+                    && keeps_verified_image(original, mapped)
+                    && original
+                        .image
+                        .as_ref()
+                        .is_some_and(|image| Arc::strong_count(image) > 1)
+                    && original
+                        .files
+                        .as_ref()
+                        .is_some_and(|files| Arc::strong_count(files) > 2)
+            });
+            if !protected {
+                return Err((ErrorKind::InvalidState, None));
+            }
+        }
+        _ => return Err((ErrorKind::InvalidState, None)),
+    }
+    let library = operation
+        .library
+        .take()
+        .ok_or((ErrorKind::Corrupted, None))?;
+    // 从系统归还（system release）开始，后续只按已知代或文件关联。
+    state.modules[index].mapped = None;
+    operation.phase = SystemPhase::ReleasingReference;
+    Ok(library)
+}
+
+fn keeps_verified_image(record: &ModuleRecord, mapped: MappedIdentity) -> bool {
+    record
+        .image
+        .as_ref()
+        .zip(record.files.as_ref())
+        .is_some_and(|(image, files)| image.identity == mapped && image.shares_files(files))
+}
+
+fn operation_shares_files(record: &ModuleRecord, operation: &SystemOperation) -> bool {
+    record
+        .files
+        .as_ref()
+        .zip(operation.files.as_ref())
+        .is_some_and(|(known, current)| Arc::ptr_eq(known, current))
+}
+
+fn confirmed_release_record<'a>(
+    state: &'a mut State,
+    operation: &SystemOperation,
+) -> std::result::Result<&'a mut ModuleRecord, ModuleFailure> {
+    let record = state
+        .modules
+        .iter_mut()
+        .find(|record| record.epoch == operation.epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    if !matches!(
+        (&operation.purpose, &record.phase),
+        (SystemPurpose::Retire, ModulePhase::Unloading)
+            | (SystemPurpose::ReturnDuplicate { .. }, ModulePhase::Loading),
+    ) {
+        return Err(module_unavailable(record));
+    }
+    let materials_moved =
+        record.files.is_none() && record.image.is_none() && operation.files.is_none();
+    if record.mapped.is_some()
+        || record.library.is_some()
+        || operation.library.is_some()
+        || (!materials_moved && !operation_shares_files(record, operation))
+    {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    Ok(record)
+}
+
+fn keep_confirmed_release_failure(
+    operation: &mut SystemOperation,
+    (kind, previous): ModuleFailure,
+) -> Error {
+    let failure = Arc::new(
+        module_error(kind, "finish confirmed native release", previous)
+            .attach("操作系统已确认归还（system release confirmed）"),
+    );
+    quarantine_mapping(operation, Some(Arc::clone(&failure)));
+    replay_module_failure(failure, "finish confirmed native release")
+}
+
+type VerificationMaterials = (
+    Option<Arc<VerifiedFiles>>,
+    Option<Arc<VerifiedFiles>>,
+    Option<Arc<VerifiedImage>>,
+);
+
+fn take_verification(
+    record: &mut ModuleRecord,
+    operation: &mut SystemOperation,
+) -> VerificationMaterials {
+    record.mapped = None;
+    (
+        operation.files.take(),
+        record.files.take(),
+        record.image.take(),
+    )
+}
+
+fn retain_reference(operation: &mut SystemOperation) -> Result<()> {
+    let files = operation
+        .files
+        .as_ref()
+        .ok_or_else(|| module_error(ErrorKind::Corrupted, "read retiring plugin files", None))?;
+    let materials = files.deployment().and_then(|deployment| {
+        let reserved = {
+            let mut state = operation.authority.state.lock();
+            reserve_retention(&mut state, operation, &deployment)
+                .map(|index| take_verification(&mut state.modules[index], operation))
+        };
+        reserved.map_err(|(kind, failure)| module_error(kind, "reserve retained plugin", failure))
+    });
+    match materials {
+        Ok(materials) => drop(materials),
+        Err(failure) => {
+            if restore_retirement(operation, ModulePhase::Loaded) {
+                return Err(failure);
+            }
+            let failure = Arc::new(failure);
+            quarantine_mapping(operation, Some(Arc::clone(&failure)));
+            return Err(replay_module_failure(failure, "retain plugin reference"));
+        }
+    }
+    finish_retention(operation)
+}
+
+fn reserve_retention(
+    state: &mut State,
+    operation: &SystemOperation,
+    deployment: &Arc<VerifiedDeployment>,
+) -> std::result::Result<usize, ModuleFailure> {
+    let index = state
+        .modules
+        .iter()
+        .position(|record| record.epoch == operation.epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    let record = &state.modules[index];
+    if !matches!(record.phase, ModulePhase::Unloading) {
+        return Err(module_unavailable(record));
+    }
+    let mapped = record.mapped.ok_or((ErrorKind::Corrupted, None))?;
+    if record.library.is_some()
+        || operation.library.is_none()
+        || !operation_shares_files(record, operation)
+        || !keeps_verified_image(record, mapped)
+    {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    if state
+        .retained_images
+        .iter()
+        .any(|other| other.mapped == mapped || other.deployment.identity() == deployment.identity())
+    {
+        return Err((ErrorKind::Conflict, None));
+    }
+    state
+        .retained_images
+        .try_reserve(1)
+        .map_err(|_| (ErrorKind::ResourceExhausted, None))?;
+    state.retained_images.push(RetainedImage {
+        retired_epoch: operation.epoch,
+        deployment: Arc::clone(deployment),
+        mapped,
+        phase: RetentionPhase::Retiring,
+    });
+    Ok(index)
+}
+
+fn retiring_position(state: &State, epoch: u64) -> Option<usize> {
+    state.retained_images.iter().position(|retained| {
+        retained.retired_epoch == epoch && matches!(retained.phase, RetentionPhase::Retiring)
+    })
+}
+
+fn finish_retention(operation: &mut SystemOperation) -> Result<()> {
+    let finished = {
+        let mut state = operation.authority.state.lock();
+        publish_retention(&mut state, operation)
+    };
+    match finished {
+        Ok(fallback) => {
+            drop(fallback);
+            Ok(())
+        }
+        Err((kind, previous)) => {
+            let failure = Arc::new(module_error(kind, "publish retained plugin", previous));
+            quarantine_mapping(operation, Some(Arc::clone(&failure)));
+            Err(replay_module_failure(failure, "retain plugin reference"))
+        }
+    }
+}
+
+fn publish_retention(
+    state: &mut State,
+    operation: &mut SystemOperation,
+) -> std::result::Result<Option<Arc<Error>>, ModuleFailure> {
+    let retained = retiring_position(state, operation.epoch).ok_or((ErrorKind::Corrupted, None))?;
+    let record = state
+        .modules
+        .iter_mut()
+        .find(|record| record.epoch == operation.epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    if !matches!(record.phase, ModulePhase::Unloading) {
+        return Err(module_unavailable(record));
+    }
+    if record.files.is_some()
+        || record.image.is_some()
+        || record.library.is_some()
+        || record.mapped.is_some()
+        || operation.files.is_some()
+    {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    let library = operation
+        .library
+        .take()
+        .ok_or((ErrorKind::Corrupted, None))?;
+    state.retained_images[retained].phase = RetentionPhase::Held(library);
+    record.phase = ModulePhase::Released;
+    operation.phase = SystemPhase::Finished;
+    Ok(record.failure.take())
+}
+
+fn restore_retirement(operation: &mut SystemOperation, phase: ModulePhase) -> bool {
+    let (fallback, reservation) = {
+        let mut state = operation.authority.state.lock();
+        let retired = retiring_position(&state, operation.epoch);
+        let Some(record) = state
+            .modules
+            .iter_mut()
+            .find(|record| record.epoch == operation.epoch)
+        else {
+            return false;
+        };
+        if !matches!(record.phase, ModulePhase::Unloading)
+            || record.library.is_some()
+            || !operation_shares_files(record, operation)
+            || !record
+                .mapped
+                .is_some_and(|mapped| keeps_verified_image(record, mapped))
+        {
+            return false;
+        }
+        let Some(library) = operation.library.take() else {
+            return false;
+        };
+        let fallback = if matches!(phase, ModulePhase::Loaded) {
+            record.failure.take()
+        } else {
+            None
+        };
+        record.library = Some(library);
+        record.phase = phase;
+        operation.phase = SystemPhase::Finished;
+        (
+            fallback,
+            retired.map(|index| state.retained_images.swap_remove(index)),
+        )
+    };
+    drop((fallback, reservation));
+    true
+}
+
+fn confirm_no_reference(operation: &mut SystemOperation, mut result: Option<Arc<Error>>) {
     let files_and_image = {
         let mut state = operation.authority.state.lock();
         state
@@ -1104,17 +1690,24 @@ fn confirm_no_reference(operation: &mut SystemOperation, result: Option<Arc<Erro
             .map(|record| {
                 record.phase = ModulePhase::Released;
                 record.mapped = None;
-                let previous = std::mem::replace(&mut record.failure, result);
+                let previous = std::mem::replace(&mut record.failure, result.take());
                 (record.files.take(), record.image.take(), previous)
             })
     };
     operation.phase = SystemPhase::Finished;
-    drop(files_and_image);
+    drop((files_and_image, operation.files.take()));
 }
 
-fn quarantine_mapping(operation: &mut SystemOperation, failure: Option<Arc<Error>>) {
-    let previous = {
+fn quarantine_mapping(operation: &mut SystemOperation, mut failure: Option<Arc<Error>>) {
+    let cleanup = {
         let mut state = operation.authority.state.lock();
+        let revalidating = match operation.purpose {
+            SystemPurpose::Revalidate { retired_epoch } => {
+                revalidation_position(&state, retired_epoch, operation.epoch)
+            }
+            _ => None,
+        };
+        let last_held_mapping = revalidating.map(|index| state.retained_images[index].mapped);
         let Some(record) = state
             .modules
             .iter_mut()
@@ -1124,23 +1717,50 @@ fn quarantine_mapping(operation: &mut SystemOperation, failure: Option<Arc<Error
             return;
         };
         record.phase = ModulePhase::Quarantined;
+        if record.library.is_none() {
+            record.library = operation.library.take();
+        }
+        // 重核开始前中断时，原映像仍由刚接管的同一系统引用（system reference）保护。
+        record.mapped = if record.library.is_some() {
+            record.mapped.or(last_held_mapping)
+        } else {
+            None
+        };
         let mapped = record.mapped;
-        let previous = failure.map(|failure| record.failure.replace(failure));
+        let previous = failure
+            .take()
+            .and_then(|failure| record.failure.replace(failure));
         let retained = record.failure.clone();
-        if let Some(mapped) = mapped {
-            for other in &mut state.modules {
-                if other.epoch != operation.epoch && other.mapped == Some(mapped) {
-                    other.phase = ModulePhase::Quarantined;
-                    if other.failure.is_none() {
-                        other.failure = retained.clone();
-                    }
+        let still_has_files = record.files.is_some();
+        let paired_epoch = match operation.purpose {
+            SystemPurpose::ReturnDuplicate { original_epoch } => Some(original_epoch),
+            _ => None,
+        };
+        for other in &mut state.modules {
+            if other.epoch != operation.epoch
+                && !matches!(other.phase, ModulePhase::Released)
+                && (mapped.is_some_and(|mapped| other.mapped == Some(mapped))
+                    || paired_epoch == Some(other.epoch))
+            {
+                other.phase = ModulePhase::Quarantined;
+                if other.failure.is_none() {
+                    other.failure = retained.clone();
                 }
             }
         }
-        previous
+        let retired = match operation.purpose {
+            SystemPurpose::Revalidate { .. } => revalidating,
+            SystemPurpose::Retire if still_has_files => retiring_position(&state, operation.epoch),
+            _ => None,
+        };
+        (
+            previous,
+            retained,
+            retired.map(|index| state.retained_images.swap_remove(index)),
+        )
     };
     operation.phase = SystemPhase::Finished;
-    drop(previous);
+    drop(cleanup);
 }
 
 fn same_round(left: &InitIdV1, right: &InitIdV1) -> bool {
@@ -1172,6 +1792,24 @@ fn ready_for_prepare(
     }
 }
 
+fn check_quarantined_version(
+    state: &State,
+    identity: &Metadata,
+) -> std::result::Result<(), ModuleFailure> {
+    let occupied = state.modules.iter().find(|record| {
+        matches!(record.phase, ModulePhase::Quarantined)
+            && (record.metadata.as_deref() == Some(identity)
+                || record.files.as_ref().is_some_and(|files| {
+                    let approved = files.manifest();
+                    approved.uuid == identity.uuid && approved.version == identity.version
+                }))
+    });
+    match occupied {
+        Some(record) => Err(module_unavailable(record)),
+        None => Ok(()),
+    }
+}
+
 fn reserve_round_record(
     state: &mut State,
     epoch: u64,
@@ -1181,6 +1819,7 @@ fn reserve_round_record(
     if !Arc::ptr_eq(image, checked) {
         return Err((ErrorKind::InvalidState, None));
     }
+    check_quarantined_version(state, metadata)?;
     let occupied = state
         .rounds
         .iter()
@@ -1703,7 +2342,11 @@ fn begin_round_call(
         (RoundPhase::Initialized | RoundPhase::NeedsClose, Operation::Close) => {}
     }
 
-    let (image, _) = ready_for_prepare(state, id.module_epoch)?;
+    let (image, metadata) = ready_for_prepare(state, id.module_epoch)?;
+    if matches!(operation, Operation::Initialize) {
+        // 已准备轮次（prepared round）的首次派发也在占用检查与调用登记的同一短锁内。
+        check_quarantined_version(state, metadata)?;
+    }
     let image = Arc::clone(image);
     let round = &state.rounds[index];
     let connection = round
@@ -3016,5 +3659,833 @@ fn finish_source_maintenance(authority: &Authority, source: &SourceWork, pending
             record.maintenance_operation = None;
             record.maintenance_pending |= pending;
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+mod residency_tests {
+    //! 用本地 Rust 共享库（shared library）核对装入、引用与退役状态。
+
+    use super::*;
+    use crate::{
+        host::Manager,
+        package::{
+            BuildDependency, BuildFile, BuildManifest, DependencyUse, PluginPackage, PluginRequest,
+            StaticDeclarations, Target,
+        },
+    };
+    use sha2::{Digest, Sha256};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            OnceLock,
+        },
+    };
+
+    const ACTUAL_UUID: [u8; 16] = [23; 16];
+    const VERSION: &str = "1.2.3+residency";
+    const FIXTURE: &str = r#"
+use pi_ffi_abi::management::*;
+
+static VERSION: &[u8] = b"1.2.3+residency";
+
+fn outcome(kind: u32, diagnostic_failure_kind: u32) -> OutcomeV1 {
+    OutcomeV1 {
+        kind,
+        diagnostic_failure_kind,
+        // SAFETY: 共同诊断表示（diagnostic representation）的整数和裸指针均可为零。
+        diagnostic: unsafe { std::mem::zeroed() },
+    }
+}
+
+#[no_mangle]
+unsafe extern "C" fn pi_ffi_metadata_v1(out: *mut MetadataV1) -> OutcomeV1 {
+    // SAFETY: 宿主提供独占输出槽（output slot），版本字节具有静态存续。
+    unsafe {
+        out.write(MetadataV1 {
+            uuid: UuidV1 { bytes: [23; 16] },
+            version: VERSION.as_ptr(),
+            version_len: VERSION.len() as u64,
+        });
+    }
+    outcome(0, 0)
+}
+
+#[no_mangle]
+extern "C" fn pi_ffi_initialize_v1(
+    _: *const ObjectRefV1,
+    _: *const ObjectRefV1,
+    _: *const ObjectRefV1,
+) -> InitReplyV1 {
+    InitReplyV1 { progress: INIT_NOT_STARTED, outcome: outcome(1, 1) }
+}
+
+#[no_mangle]
+extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
+    outcome(1, 1)
+}
+"#;
+
+    /// 本测试进程内唯一临时目录（temporary directory），析构时清理创建的文件。
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            loop {
+                let id = NEXT.fetch_add(1, Ordering::Relaxed);
+                let path =
+                    std::env::temp_dir().join(format!("pi-ffi-t24-{}-{id}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(failure) if failure.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(failure) => panic!("{failure}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 使用仓库的共同应用二进制接口（ABI），只编译当前单元用例的装入输入。
+    fn fixture_binary() -> &'static [u8] {
+        static BINARY: OnceLock<Vec<u8>> = OnceLock::new();
+        BINARY.get_or_init(|| compile_fixture(FIXTURE))
+    }
+
+    fn compile_fixture(text: &str) -> Vec<u8> {
+        let dir = TestDirectory::new();
+        let abi_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pi_ffi_abi/src/lib.rs");
+        let abi = dir.0.join("libpi_ffi_abi.rlib");
+        let source = dir.0.join("fixture.rs");
+        let library = dir.0.join("fixture.so");
+        fs::write(&source, text).unwrap();
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        compile(
+            Command::new(&compiler)
+                .args([
+                    "--crate-name",
+                    "pi_ffi_abi",
+                    "--crate-type=rlib",
+                    "--edition=2021",
+                ])
+                .arg(abi_source)
+                .arg("-o")
+                .arg(&abi),
+        );
+        compile(
+            Command::new(&compiler)
+                .args([
+                    "--crate-name",
+                    "t24_fixture",
+                    "--crate-type=cdylib",
+                    "--edition=2021",
+                ])
+                .arg("--extern")
+                .arg(format!("pi_ffi_abi={}", abi.display()))
+                .arg(source)
+                .arg("-o")
+                .arg(&library),
+        );
+        fs::read(library).unwrap()
+    }
+
+    /// 编译失败时保留原命令与编译器诊断（compiler diagnostic）。
+    fn compile(command: &mut Command) {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{command:?}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// 每份制品（artifact）有独立实际文件身份，仅用于共同元信息边界。
+    struct Artifact {
+        dir: TestDirectory,
+        path: PathBuf,
+        digest: [u8; 32],
+        version: &'static str,
+    }
+
+    impl Artifact {
+        fn new() -> Self {
+            Self::from_binary(fixture_binary(), VERSION)
+        }
+
+        fn from_binary(binary: &[u8], version: &'static str) -> Self {
+            let dir = TestDirectory::new();
+            let path = dir.0.join("fixture.so");
+            fs::write(&path, binary).unwrap();
+            Self {
+                dir,
+                path,
+                digest: Sha256::digest(binary).into(),
+                version,
+            }
+        }
+
+        fn package(&self, uuid: [u8; 16]) -> PluginPackage {
+            self.package_from(self.manifest(uuid))
+        }
+
+        fn package_from(&self, manifest: BuildManifest) -> PluginPackage {
+            // 安全前提（safety）。本测试编译并保持制品（artifact），仅使用共同元信息边界。
+            unsafe { PluginPackage::from_verified_build(self.dir.0.clone(), manifest) }.unwrap()
+        }
+
+        fn unloadable(&self) -> PluginPackage {
+            // 安全前提（safety）。本制品只读取静态元信息（metadata），无业务、任务或退出回调。
+            unsafe {
+                PluginPackage::from_verified_unloadable_build(
+                    self.dir.0.clone(),
+                    self.manifest(ACTUAL_UUID),
+                )
+            }
+            .unwrap()
+        }
+
+        fn manifest(&self, uuid: [u8; 16]) -> BuildManifest {
+            let host = build();
+            BuildManifest {
+                target: Target::LinuxX86_64Gnu,
+                uuid,
+                version: self.version.parse().unwrap(),
+                library: BuildFile {
+                    path: self.path.clone(),
+                    sha256: self.digest,
+                },
+                dependencies: Vec::new(),
+                rust_build_sha256: host.rust_build_sha256,
+                allocator: host.allocator,
+                static_declarations: StaticDeclarations::Empty,
+            }
+        }
+
+        fn mapped(&self) -> bool {
+            // 读取进程映射（process mappings），不增加额外系统引用（system reference）。
+            let path = self.path.canonicalize().unwrap();
+            fs::read_to_string("/proc/self/maps")
+                .unwrap()
+                .lines()
+                .any(|line| line.ends_with(path.to_str().unwrap()))
+        }
+    }
+
+    fn build() -> HostBuild {
+        HostBuild {
+            rust_build_sha256: [42; 32],
+            allocator: "unit test".into(),
+        }
+    }
+
+    fn request(uuid: [u8; 16]) -> PluginRequest {
+        PluginRequest {
+            uuid,
+            version: "=1.2.3".parse().unwrap(),
+        }
+    }
+
+    fn loaded_epoch(package: &PluginPackage) -> u64 {
+        let files = loader::verify_files(package, &build()).unwrap();
+        let LoadAdmission::Reuse(view) = AUTHORITY.reserve_load(files).unwrap() else {
+            panic!("等待已活动的管理代（active generation）");
+        };
+        view.epoch
+    }
+
+    fn new_operation(package: &PluginPackage) -> SystemOperation {
+        let files = loader::verify_files(package, &build()).unwrap();
+        let LoadAdmission::New(operation) = AUTHORITY.reserve_load(files).unwrap() else {
+            panic!("等待新装入操作（new load operation）");
+        };
+        operation
+    }
+
+    /// 默认退役（default retirement）应结束旧文件持有和原代，保留实际映像供新代接入。
+    #[test]
+    fn test_t24_default_retirement_retains_mapping() {
+        let artifact = Artifact::new();
+        let manager = Manager::process(build()).unwrap();
+        let package = artifact.package(ACTUAL_UUID);
+        let request = request(ACTUAL_UUID);
+        let original = manager.load(&package, &request).unwrap();
+        let epoch = loaded_epoch(&package);
+        let files = {
+            let state = AUTHORITY.state.lock();
+            let record = state
+                .modules
+                .iter()
+                .find(|record| record.epoch == epoch)
+                .unwrap();
+            Arc::downgrade(record.files.as_ref().unwrap())
+        };
+        assert!(artifact.mapped());
+        original.unload().unwrap();
+        assert!(
+            artifact.mapped(),
+            "默认退役仍须持有实际映像（mapped image）"
+        );
+        assert!(files.upgrade().is_none());
+        original.unload().unwrap();
+        assert_eq!(original.metadata().version.to_string(), VERSION);
+        let reloaded = manager.load(&package, &request).unwrap();
+        let reloaded_epoch = loaded_epoch(&package);
+        assert_ne!(epoch, reloaded_epoch);
+        original.unload().unwrap();
+        assert_eq!(reloaded.metadata(), original.metadata());
+        reloaded.unload().unwrap();
+        let retained = {
+            let mut state = AUTHORITY.state.lock();
+            assert!(state
+                .retained_images
+                .iter()
+                .all(|record| record.retired_epoch != epoch));
+            let index = state
+                .retained_images
+                .iter()
+                .position(|record| record.retired_epoch == reloaded_epoch)
+                .unwrap();
+            state.retained_images.swap_remove(index)
+        };
+        let RetentionPhase::Held(reference) = retained.phase else {
+            panic!("保留记录（retention record）应已持有实际引用");
+        };
+        // 清理本单元制品并观察单次系统归还（system release）是否足以解除映像。
+        loader::close(reference).unwrap();
+        assert!(!artifact.mapped());
+    }
+
+    /// 卸载（unload）遇到活动复用（active reuse）的借用时返回 Busy，借用结束后可重试。
+    #[test]
+    fn test_t24_retirement_checks_active_borrows() {
+        let artifact = Artifact::new();
+        let manager = Manager::process(build()).unwrap();
+        let package = artifact.package(ACTUAL_UUID);
+        let plugin = manager.load(&package, &request(ACTUAL_UUID)).unwrap();
+        let epoch = loaded_epoch(&package);
+        let borrowed = {
+            let state = AUTHORITY.state.lock();
+            let record = state
+                .modules
+                .iter()
+                .find(|record| record.epoch == epoch)
+                .unwrap();
+            reuse_snapshot(record).unwrap()
+        };
+        let failure = plugin
+            .unload()
+            .expect_err("活动借用（active borrow）仍在时不得退役");
+        assert_eq!(*failure.current_context(), ErrorKind::Busy);
+        assert!(artifact.mapped());
+        drop(borrowed);
+        plugin.unload().unwrap();
+    }
+
+    /// 装入（load）在实际元信息不匹配时保留原诊断及两个完整身份。
+    #[test]
+    fn test_t24_rejected_mapping_retains_reference_and_identity() {
+        let artifact = Artifact::new();
+        let manager = Manager::process(build()).unwrap();
+        let approved = [24; 16];
+        let package = artifact.package(approved);
+        let request = request(approved);
+        let rejected = manager.load(&package, &request).err().unwrap();
+        assert_eq!(*rejected.current_context(), ErrorKind::Conflict);
+        assert!(
+            artifact.mapped(),
+            "装入后拒绝仍须保全实际引用（system reference）"
+        );
+        let replay = manager.load(&package, &request).err().unwrap();
+        assert_eq!(*replay.current_context(), ErrorKind::Conflict);
+        assert!(pi_result::debug_message(&replay).contains("实际 UUID"));
+        let identity = loader::file_identity(&package).unwrap();
+        let state = AUTHORITY.state.lock();
+        let record = state
+            .modules
+            .iter()
+            .find(|record| {
+                record
+                    .files
+                    .as_ref()
+                    .is_some_and(|files| files.identity() == identity)
+            })
+            .unwrap();
+        assert!(matches!(record.phase, ModulePhase::Quarantined));
+        assert!(record.library.is_some());
+        assert_eq!(record.metadata.as_ref().unwrap().uuid, ACTUAL_UUID);
+        assert_eq!(record.files.as_ref().unwrap().manifest().uuid, approved);
+    }
+
+    /// 装入操作（load operation）中断后仍持一份真实引用，维护不取得退役资格。
+    #[test]
+    fn test_t24_interrupted_load_is_not_scheduled_for_release() {
+        let artifact = Artifact::new();
+        let package = artifact.package(ACTUAL_UUID);
+        let mut operation = new_operation(&package);
+        let epoch = operation.epoch();
+        operation.open().unwrap();
+        let mapped = loader::mapped_identity(operation.library().unwrap()).unwrap();
+        AUTHORITY.record_mapping(epoch, mapped).unwrap();
+        drop(operation);
+        assert!(artifact.mapped());
+        let state = AUTHORITY.state.lock();
+        let record = state
+            .modules
+            .iter()
+            .find(|record| record.epoch == epoch)
+            .unwrap();
+        assert!(
+            matches!(record.phase, ModulePhase::Quarantined),
+            "装入中断须隔离（quarantine）"
+        );
+        assert!(record.library.is_some());
+    }
+
+    /// 活动复用和保留复用（retained reuse）核对策略、实际依赖身份与同文件别名。
+    #[test]
+    fn test_t24_load_checks_policy_and_dependency_identity() {
+        let artifact = Artifact::new();
+        let manager = Manager::process(build()).unwrap();
+        let request = request(ACTUAL_UUID);
+        let plain = artifact.package(ACTUAL_UUID);
+        let unloadable = artifact.unloadable();
+        assert!(unloadable.clone().unload_policy() == UnloadPolicy::ReleaseWhenQuiescent);
+        assert_eq!(
+            *manager
+                .find(&[plain, unloadable.clone()], &request)
+                .err()
+                .unwrap()
+                .current_context(),
+            ErrorKind::Conflict,
+        );
+
+        let alias = artifact.dir.0.join("alias.so");
+        fs::hard_link(&artifact.path, &alias).unwrap();
+        let companion = artifact.dir.0.join("companion.so");
+        let different = artifact.dir.0.join("different.so");
+        fs::write(&companion, fixture_binary()).unwrap();
+        fs::write(&different, fixture_binary()).unwrap();
+        let mut manifest = artifact.manifest(ACTUAL_UUID);
+        manifest.dependencies.push(BuildDependency {
+            load_name: "companion.so".into(),
+            file: BuildFile {
+                path: companion,
+                sha256: manifest.library.sha256,
+            },
+            usage: DependencyUse::RuntimeInput,
+        });
+        let package = artifact.package_from(manifest.clone());
+        // 安全前提（safety）。同一制品仍只经历元信息检查和已核依赖的路径核对。
+        let strategy_changed = unsafe {
+            PluginPackage::from_verified_unloadable_build(artifact.dir.0.clone(), manifest.clone())
+        }
+        .unwrap();
+        manifest.library.path = alias;
+        let same = artifact.package_from(manifest.clone());
+        manifest.dependencies[0].file.path = different;
+        let changed = artifact.package_from(manifest);
+
+        let plugin = manager.load(&package, &request).unwrap();
+        assert_eq!(
+            manager.load(&same, &request).unwrap().metadata(),
+            plugin.metadata()
+        );
+        for candidate in [&strategy_changed, &changed] {
+            let rejection = manager.load(candidate, &request).err().unwrap();
+            assert_eq!(*rejection.current_context(), ErrorKind::Conflict);
+        }
+        plugin.unload().unwrap();
+        for candidate in [&strategy_changed, &changed] {
+            let rejection = manager.load(candidate, &request).err().unwrap();
+            assert_eq!(*rejection.current_context(), ErrorKind::Conflict);
+        }
+        manager.load(&same, &request).unwrap().unload().unwrap();
+    }
+
+    /// 两次重新接入（revalidation）交错时只交出原引用一次，原代继续重放。
+    #[test]
+    fn test_t24_retained_admission_is_exclusive() {
+        let artifact = Artifact::new();
+        let package = artifact.package(ACTUAL_UUID);
+        let request = request(ACTUAL_UUID);
+        let manager = Manager::process(build()).unwrap();
+        let original = manager.load(&package, &request).unwrap();
+        let old_epoch = loaded_epoch(&package);
+        original.unload().unwrap();
+        let pending = new_operation(&package);
+        let epoch = pending.epoch();
+        assert_ne!(old_epoch, epoch);
+        let mapped = loader::mapped_identity(pending.library.as_ref().unwrap()).unwrap();
+        let racing = manager.load(&package, &request).err().unwrap();
+        assert_eq!(*racing.current_context(), ErrorKind::Busy);
+        original.unload().unwrap();
+        assert!(artifact.mapped());
+        drop(pending);
+        let replay = manager.load(&package, &request).err().unwrap();
+        assert_eq!(*replay.current_context(), ErrorKind::Internal);
+        assert!(pi_result::debug_message(&replay).contains("native load interrupted"));
+        original.unload().unwrap();
+        let state = AUTHORITY.state.lock();
+        assert!(state
+            .retained_images
+            .iter()
+            .all(|record| record.retired_epoch != old_epoch));
+        let record = state
+            .modules
+            .iter()
+            .find(|record| record.epoch == epoch)
+            .unwrap();
+        assert!(matches!(record.phase, ModulePhase::Quarantined));
+        assert!(record.library.is_some());
+        assert!(record.mapped == Some(mapped));
+    }
+
+    /// 原加载路径消失时实际映像重核（image revalidation）失败，新代保存原文件错误。
+    #[test]
+    fn test_t24_failed_revalidation_replays_native_diagnostic() {
+        let artifact = Artifact::new();
+        let alias = artifact.dir.0.join("alias.so");
+        fs::hard_link(&artifact.path, &alias).unwrap();
+        let package = artifact.package(ACTUAL_UUID);
+        let mut manifest = artifact.manifest(ACTUAL_UUID);
+        manifest.library.path = alias;
+        let alternative = artifact.package_from(manifest);
+        let request = request(ACTUAL_UUID);
+        let manager = Manager::process(build()).unwrap();
+        let original = manager.load(&package, &request).unwrap();
+        let epoch = loaded_epoch(&package);
+        original.unload().unwrap();
+
+        let renamed = artifact.dir.0.join("renamed.so");
+        fs::rename(&artifact.path, &renamed).unwrap();
+        for _ in 0..2 {
+            let native = manager.load(&alternative, &request).err().unwrap();
+            assert_eq!(*native.current_context(), ErrorKind::Io);
+            assert!(pi_result::debug_message(&native).contains(artifact.path.to_str().unwrap()));
+        }
+        original.unload().unwrap();
+        assert_eq!(original.metadata().version.to_string(), VERSION);
+        let state = AUTHORITY.state.lock();
+        assert!(state
+            .retained_images
+            .iter()
+            .all(|retained| retained.retired_epoch != epoch));
+    }
+
+    /// 在原文件移出前后中断保留交接（retention handoff），分别由维护和析构完成。
+    #[test]
+    fn test_t24_retirement_recovers_both_handoff_windows() {
+        let manager = Manager::process(build()).unwrap();
+        let request = request(ACTUAL_UUID);
+        for moved in [false, true] {
+            let artifact = Artifact::new();
+            let package = artifact.package(ACTUAL_UUID);
+            let plugin = manager.load(&package, &request).unwrap();
+            let epoch = loaded_epoch(&package);
+            let mut operation = AUTHORITY.prepare_unload(epoch).unwrap().unwrap();
+            let deployment = operation.files.as_ref().unwrap().deployment().unwrap();
+            let materials = {
+                let mut state = AUTHORITY.state.lock();
+                let index = reserve_retention(&mut state, &operation, &deployment).unwrap();
+                moved.then(|| take_verification(&mut state.modules[index], &mut operation))
+            };
+            drop(materials);
+            let loading = manager.load(&package, &request).err().unwrap();
+            assert_eq!(*loading.current_context(), ErrorKind::Busy);
+            drop(operation);
+
+            if !moved {
+                assert_eq!(
+                    *plugin.unload().unwrap_err().current_context(),
+                    ErrorKind::Busy
+                );
+                assert!(artifact.mapped());
+                assert_eq!(manager.maintain(1).unwrap(), 1);
+            }
+            plugin.unload().unwrap();
+            assert!(artifact.mapped());
+            let state = AUTHORITY.state.lock();
+            let record = state
+                .modules
+                .iter()
+                .find(|record| record.epoch == epoch)
+                .unwrap();
+            assert!(matches!(record.phase, ModulePhase::Released));
+            assert!(record.files.is_none() && record.image.is_none() && record.library.is_none());
+            assert!(state.retained_images.iter().any(|retained| {
+                retained.retired_epoch == epoch && matches!(retained.phase, RetentionPhase::Held(_))
+            }));
+        }
+    }
+
+    /// 实际归还（system release）成功后中断确认，析构仅结清资料和旧代。
+    #[test]
+    fn test_t24_confirmed_release_recovers_without_returning_again() {
+        let manager = Manager::process(build()).unwrap();
+        let request = request(ACTUAL_UUID);
+        let artifact = Artifact::new();
+        let package = artifact.unloadable();
+        let plugin = manager.load(&package, &request).unwrap();
+        let epoch = loaded_epoch(&package);
+        let mut operation = AUTHORITY.prepare_unload(epoch).unwrap().unwrap();
+        let reference = {
+            let mut state = AUTHORITY.state.lock();
+            start_reference_release(&mut state, &mut operation).unwrap()
+        };
+        assert!(artifact.mapped());
+        loader::close(reference).unwrap();
+        operation.phase = SystemPhase::ReleaseConfirmed;
+        assert!(!artifact.mapped());
+        assert_eq!(
+            *plugin.unload().unwrap_err().current_context(),
+            ErrorKind::Busy
+        );
+        drop(operation);
+        plugin.unload().unwrap();
+        assert!(!artifact.mapped());
+        let reloaded = manager.load(&package, &request).unwrap();
+        assert_ne!(loaded_epoch(&package), epoch);
+        reloaded.unload().unwrap();
+        assert!(!artifact.mapped());
+    }
+
+    /// 系统归还结果（release result）尚未登记时中断，同文件重放原错误。
+    #[test]
+    fn test_t24_unconfirmed_release_drops_stale_address() {
+        let artifact = Artifact::new();
+        let manager = Manager::process(build()).unwrap();
+        let package = artifact.unloadable();
+        let request = request(ACTUAL_UUID);
+        let plugin = manager.load(&package, &request).unwrap();
+        let epoch = loaded_epoch(&package);
+        let mut operation = AUTHORITY.prepare_unload(epoch).unwrap().unwrap();
+        let reference = {
+            let mut state = AUTHORITY.state.lock();
+            let reference = start_reference_release(&mut state, &mut operation).unwrap();
+            let record = state
+                .modules
+                .iter()
+                .find(|record| record.epoch == epoch)
+                .unwrap();
+            assert!(record.mapped.is_none());
+            reference
+        };
+        loader::close(reference).unwrap();
+        drop(operation);
+        let original = plugin.unload().unwrap_err();
+        let replay = manager.load(&package, &request).err().unwrap();
+        assert_eq!(*original.current_context(), ErrorKind::Internal);
+        assert_eq!(*replay.current_context(), ErrorKind::Internal);
+        assert!(pi_result::debug_message(&replay).contains("native release interrupted"));
+        assert!(!artifact.mapped());
+        let other = Artifact::new();
+        manager
+            .load(&other.package(ACTUAL_UUID), &request)
+            .unwrap()
+            .unload()
+            .unwrap();
+    }
+
+    /// 同一映像的额外系统引用（duplicate reference）须在原引用受保护时归还。
+    #[test]
+    fn test_t24_duplicate_reference_requires_original_protection() {
+        let manager = Manager::process(build()).unwrap();
+        let request = request(ACTUAL_UUID);
+        for protected in [true, false] {
+            let artifact = Artifact::new();
+            let package = artifact.unloadable();
+            let plugin = manager.load(&package, &request).unwrap();
+            let epoch = loaded_epoch(&package);
+            let files = loader::verify_files(&package, &build()).unwrap();
+            let interruption = Arc::new(Error::new(ErrorKind::Internal));
+            let mut duplicate = {
+                let mut state = AUTHORITY.state.lock();
+                // 单独预留第二份实际装入（native load），以触达系统已返回额外引用的分支。
+                reserve_load_record(&AUTHORITY, &mut state, &files, &interruption).unwrap()
+            };
+            duplicate.open().unwrap();
+            let image = loader::verify_image(duplicate.library().unwrap(), files).unwrap();
+            AUTHORITY
+                .record_mapping(duplicate.epoch(), image.identity)
+                .unwrap();
+            let mut raw = std::mem::MaybeUninit::uninit();
+            // 安全前提（safety）。当前实际引用保活已核标准入口，输出槽独占可写。
+            let outcome = unsafe { (image.entries.metadata)(raw.as_mut_ptr()) };
+            assert_eq!(outcome.kind, 0);
+            // 安全前提（safety）。成功写入后从仍受保护的映像复制数据。
+            let metadata = unsafe { loader::copy_metadata(&image, raw.assume_init()) }.unwrap();
+            duplicate.record_metadata(&metadata).unwrap();
+            duplicate.record_metadata(&metadata).unwrap();
+            let changed = Metadata {
+                uuid: [99; 16],
+                version: metadata.version.clone(),
+            };
+            assert_eq!(
+                *duplicate
+                    .record_metadata(&changed)
+                    .unwrap_err()
+                    .current_context(),
+                ErrorKind::Conflict,
+            );
+
+            if protected {
+                let reused = duplicate.confirm_loaded(image, metadata).unwrap();
+                assert_eq!(reused.epoch, epoch);
+                assert!(artifact.mapped());
+                plugin.unload().unwrap();
+                assert!(!artifact.mapped());
+            } else {
+                let duplicate_epoch = duplicate.epoch();
+                let original = {
+                    let state = AUTHORITY.state.lock();
+                    let record = state
+                        .modules
+                        .iter()
+                        .find(|record| record.epoch == epoch)
+                        .unwrap();
+                    reuse_snapshot(record).unwrap()
+                };
+                compare_reuse(&original, duplicate.files.as_ref().unwrap()).unwrap();
+                recheck_reuse(&AUTHORITY, &original).unwrap();
+                duplicate.purpose = SystemPurpose::ReturnDuplicate {
+                    original_epoch: epoch,
+                };
+                drop(original);
+                drop(image);
+                assert_eq!(
+                    *duplicate.release().unwrap_err().current_context(),
+                    ErrorKind::InvalidState
+                );
+                assert!(artifact.mapped());
+                let state = AUTHORITY.state.lock();
+                let record = state
+                    .modules
+                    .iter()
+                    .find(|record| record.epoch == duplicate_epoch)
+                    .unwrap();
+                assert!(matches!(record.phase, ModulePhase::Quarantined));
+                assert!(record.library.is_some());
+            }
+        }
+    }
+
+    /// 没有系统引用（system reference）的拒绝结束装入预留，同文件可以再次申请。
+    #[test]
+    fn test_t24_rejected_reservation_without_reference_can_retry() {
+        let artifact = Artifact::new();
+        let package = artifact.package(ACTUAL_UUID);
+        let reserved = new_operation(&package);
+        let epoch = reserved.epoch();
+        assert!(matches!(reserved.phase, SystemPhase::Reserved));
+        let rejected =
+            reserved.reject(Error::new(ErrorKind::Conflict).attach("pre-open unit input"));
+        assert_eq!(*rejected.current_context(), ErrorKind::Conflict);
+        assert!(pi_result::debug_message(&rejected).contains("pre-open unit input"));
+        assert!(!artifact.mapped());
+        let next = new_operation(&package);
+        assert_ne!(next.epoch(), epoch);
+        let state = AUTHORITY.state.lock();
+        let record = state
+            .modules
+            .iter()
+            .find(|record| record.epoch == epoch)
+            .unwrap();
+        assert!(matches!(record.phase, ModulePhase::Released));
+        assert!(record.library.is_none() && record.files.is_none());
+    }
+
+    /// 用实际已核身份检查同一完整版本的两处准入，并允许另一构建版本准备。
+    #[test]
+    fn test_t24_quarantine_blocks_full_identity_at_both_round_gates() {
+        const OCCUPIED: &str = "1.2.3+occupied";
+        const INDEPENDENT: &str = "1.2.3+independent";
+        let manager = Manager::process(build()).unwrap();
+        let native = compile_fixture(&FIXTURE.replace(VERSION, OCCUPIED));
+        let artifact = Artifact::from_binary(&native, OCCUPIED);
+        let package = artifact.package(ACTUAL_UUID);
+        let actual_request = request(ACTUAL_UUID);
+        let plugin = manager.load(&package, &actual_request).unwrap();
+        let epoch = loaded_epoch(&package);
+        let prepared = {
+            let mut state = AUTHORITY.state.lock();
+            let image = Arc::clone(ready_for_prepare(&state, epoch).unwrap().0);
+            let prepared = reserve_round_record(&mut state, epoch, &image).unwrap();
+            // 只给首次派发（first dispatch）的准入分支建立已准备状态。
+            state
+                .rounds
+                .iter_mut()
+                .find(|round| same_round(&round.id, &prepared))
+                .unwrap()
+                .phase = RoundPhase::Prepared;
+            prepared
+        };
+
+        let approved_uuid = [81; 16];
+        let rejected = Artifact::from_binary(&native, "1.2.3+approved");
+        let failure = manager
+            .load(&rejected.package(approved_uuid), &request(approved_uuid))
+            .err()
+            .unwrap();
+        assert_eq!(*failure.current_context(), ErrorKind::Conflict);
+        assert!(rejected.mapped());
+        let preparing = AUTHORITY.reserve_round(epoch, false).err().unwrap();
+        let starting = AUTHORITY
+            .begin_round(round_id(&prepared), Operation::Initialize)
+            .err()
+            .unwrap();
+        for failure in [preparing, starting] {
+            assert_eq!(*failure.current_context(), ErrorKind::Conflict);
+            assert!(pi_result::debug_message(&failure).contains("批准版本"));
+        }
+        {
+            let state = AUTHORITY.state.lock();
+            let approved = Metadata {
+                uuid: approved_uuid,
+                version: rejected.version.parse().unwrap(),
+            };
+            assert_eq!(
+                check_quarantined_version(&state, &approved).unwrap_err().0,
+                ErrorKind::Conflict
+            );
+            assert!(state.rounds.iter().any(|round| {
+                same_round(&round.id, &prepared) && matches!(round.phase, RoundPhase::Prepared)
+            }));
+            assert!(state
+                .calls
+                .iter()
+                .all(|call| !same_round(&call.id, &prepared)));
+        }
+        assert!(matches!(
+            AUTHORITY
+                .begin_round(round_id(&prepared), Operation::Close)
+                .unwrap(),
+            RoundAdmission::ReturnHoldings
+        ));
+        AUTHORITY.maintain(Some(prepared), 1).unwrap();
+        plugin.unload().unwrap();
+
+        let independent = compile_fixture(&FIXTURE.replace(VERSION, INDEPENDENT));
+        let other = Artifact::from_binary(&independent, INDEPENDENT);
+        let other_package = other.package(ACTUAL_UUID);
+        let other_plugin = manager.load(&other_package, &actual_request).unwrap();
+        let other_epoch = loaded_epoch(&other_package);
+        let other_round = {
+            let mut state = AUTHORITY.state.lock();
+            let image = Arc::clone(ready_for_prepare(&state, other_epoch).unwrap().0);
+            reserve_round_record(&mut state, other_epoch, &image).unwrap()
+        };
+        let cancelled =
+            AUTHORITY.fail_prepare(round_id(&other_round), Error::new(ErrorKind::InvalidInput));
+        assert_eq!(*cancelled.current_context(), ErrorKind::InvalidInput);
+        AUTHORITY.maintain(Some(other_round), 2).unwrap();
+        other_plugin.unload().unwrap();
     }
 }

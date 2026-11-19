@@ -56,6 +56,7 @@ pub(super) fn manager_find(
             || manifest.library.sha256 != selected.library.sha256
             || manifest.rust_build_sha256 != selected.rust_build_sha256
             || manifest.allocator != selected.allocator
+            || package.unload_policy() != best.unload_policy()
         {
             return Err(Error::new(ErrorKind::Conflict).attach(selected.version.to_string()));
         }
@@ -107,6 +108,7 @@ pub(super) fn manager_load(
                     })?;
                     // 安全前提（safety）。标准入口成功后完整写入槽位，复制持续借用原系统引用。
                     let metadata = unsafe { loader::copy_metadata(&image, raw.assume_init()) }?;
+                    operation.record_metadata(&metadata)?;
                     check_metadata(&metadata, manifest, request)?;
                     Ok((image, metadata))
                 },
