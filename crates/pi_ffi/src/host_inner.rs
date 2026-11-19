@@ -1,6 +1,9 @@
 use super::*;
-use crate::loader;
-use pi_result::{Error, ErrorKind};
+use crate::{authority::LoadAdmission, loader};
+use pi_ffi_abi::management::MetadataV1;
+use pi_ffi_core::{boundary, diagnostic};
+use pi_result::{attachment::Operation as ErrorOperation, Error, ErrorKind};
+use std::mem::MaybeUninit;
 
 pub(super) unsafe fn terminal_input<T: Send + Sync + 'static>(
     terminal: Arc<T>,
@@ -56,7 +59,80 @@ pub(super) fn manager_load(
     package: &PluginPackage,
     request: &PluginRequest,
 ) -> Result<Plugin> {
-    todo!("装入前核版本请求和构建记录。预留文件记录，首次装入后先记实际映像，再核配套及入口，受保护读取并复制元信息。调用方的版本范围对本次实际宿主副本成立才成功。同文件复用使用既有副本；首次装入及复用失败均保留已知的实际和批准身份或完整版本。失败保留实际归还结果。")
+    let manifest = package.manifest();
+    if manifest.uuid != request.uuid || !request.version.matches(&manifest.version) {
+        return Err(Error::new(ErrorKind::NotFound)
+            .attach(ErrorOperation("match plugin load request"))
+            .attach(request.version.to_string()));
+    }
+
+    let authority = manager.authority;
+    let build = authority.build()?;
+    let files = loader::verify_files(package, &build)?;
+    let view = match authority.reserve_load(Arc::clone(&files))? {
+        LoadAdmission::Reuse(view) => {
+            check_metadata(&view.metadata, manifest, request)?;
+            view
+        }
+        LoadAdmission::New(mut operation) => {
+            let epoch = operation.epoch();
+            let inspected = boundary::catch(
+                boundary::Context {
+                    operation: "load plugin",
+                    module_epoch: epoch,
+                    round: 0,
+                    source: 0,
+                },
+                || {
+                    operation.open()?;
+                    let module = operation.library()?;
+                    let mapped = loader::mapped_identity(module)?;
+                    authority.record_mapping(epoch, mapped)?;
+                    let image = loader::verify_image(module, files)?;
+                    let mut raw = MaybeUninit::<MetadataV1>::uninit();
+                    // 安全前提（safety）。标准入口已核实归属于本次持有的模块，输出槽独占可写。
+                    let outcome = unsafe { (image.entries.metadata)(raw.as_mut_ptr()) };
+                    // 安全前提（safety）。仍保有同一系统引用。元信息入口没有已登记诊断来源。
+                    unsafe { diagnostic::decode_management(None, outcome) }.map_err(|failure| {
+                        failure.attach(ErrorOperation("read plugin metadata"))
+                    })?;
+                    // 安全前提（safety）。标准入口成功后完整写入槽位，复制持续借用原系统引用。
+                    let metadata = unsafe { loader::copy_metadata(&image, raw.assume_init()) }?;
+                    check_metadata(&metadata, manifest, request)?;
+                    Ok((image, metadata))
+                },
+            );
+            match inspected {
+                Ok((image, metadata)) => operation.confirm_loaded(image, metadata)?,
+                Err(failure) => return Err(operation.reject(failure)),
+            }
+        }
+    };
+    Ok(Plugin {
+        authority,
+        epoch: view.epoch,
+        metadata: view.metadata,
+    })
+}
+
+fn check_metadata(
+    metadata: &Metadata,
+    manifest: &BuildManifest,
+    request: &PluginRequest,
+) -> Result<()> {
+    if metadata.uuid == manifest.uuid
+        && metadata.version == manifest.version
+        && metadata.uuid == request.uuid
+        && request.version.matches(&metadata.version)
+    {
+        return Ok(());
+    }
+    Err(Error::new(ErrorKind::Conflict)
+        .attach(ErrorOperation("match mapped plugin metadata"))
+        .attach(format!("实际 UUID（actual UUID） {:02x?}", metadata.uuid))
+        .attach(format!("批准 UUID（approved UUID） {:02x?}", manifest.uuid))
+        .attach(format!("实际版本（actual version） {}", metadata.version))
+        .attach(format!("批准版本（approved version） {}", manifest.version)))
 }
 
 pub(super) fn manager_maintain(manager: &Manager, budget: usize) -> Result<usize> {
@@ -93,7 +169,10 @@ pub(super) fn plugin_current_initialization(plugin: &Plugin) -> Result<Option<In
 }
 
 pub(super) fn plugin_unload(plugin: &Plugin) -> Result<()> {
-    todo!("停开新 C 调用并检查退出条件；唯一移出系统持有，锁外释放。成功结束本引用。失败记录保留占用并禁止原地址复用。")
+    if let Some(operation) = plugin.authority.prepare_unload(plugin.epoch)? {
+        operation.release()?;
+    }
+    Ok(())
 }
 
 pub(super) fn initialization_id(initialization: &Initialization) -> InitIdV1 {

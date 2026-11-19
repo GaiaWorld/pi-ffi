@@ -919,7 +919,26 @@ pub(super) fn verified_files_match_reuse(
     current: &VerifiedFiles,
     candidate: &VerifiedFiles,
 ) -> bool {
-    todo!("只比较现有资料。核目标平台、主文件身份和摘要、配套构建摘要、分配器和静态声明归属。按目标平台既有加载名规则逐项核对两份依赖的用途、摘要和已打开文件身份。声明顺序和同一文件的不同路径不改变结果。")
+    let approved = current.package.manifest();
+    let proposed = candidate.package.manifest();
+    if approved.target != proposed.target
+        || current.main.identity != candidate.main.identity
+        || approved.library.sha256 != proposed.library.sha256
+        || approved.rust_build_sha256 != proposed.rust_build_sha256
+        || approved.allocator != proposed.allocator
+        || approved.static_declarations != proposed.static_declarations
+        || approved.dependencies.len() != proposed.dependencies.len()
+    {
+        return false;
+    }
+    approved.dependencies.iter().zip(&current.dependencies).all(|(known, file)| {
+        proposed.dependencies.iter().zip(&candidate.dependencies).any(|(new, new_file)| {
+            same_load_name(approved.target, known.load_name.as_bytes(), new.load_name.as_bytes())
+                && known.usage == new.usage
+                && known.file.sha256 == new.file.sha256
+                && file.identity == new_file.identity
+        })
+    })
 }
 
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]

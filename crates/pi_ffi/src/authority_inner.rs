@@ -1,5 +1,6 @@
 use super::*;
-use pi_result::ErrorKind;
+use crate::loader;
+use pi_result::{attachment::Operation as ErrorOperation, ErrorKind};
 
 pub(super) fn authority_process(build: HostBuild) -> Result<&'static Authority> {
     let build = Arc::new(build);
@@ -32,7 +33,34 @@ pub(super) fn authority_reserve_load(
     authority: &'static Authority,
     files: Arc<VerifiedFiles>,
 ) -> Result<LoadAdmission> {
-    todo!("按实际文件登记唯一装入。已有记录时，短锁内只从实际映像、系统引用及资料齐备的已装入记录取得原代际和文件及元信息的共享持有。还在处理或结果未确认时按原状态返回。锁外用宿主副本核身份和完整版本，差异返回带原实际值和批准值的 pi_result。经 VerifiedFiles::matches_reuse 核新资料。兼容时重新在短锁内核原代际、已装入状态及原资料，才交付复用。实际请求再经 host 核对。")
+    let fallback = Arc::new(module_error(
+        ErrorKind::Internal,
+        "native load interrupted before confirmation",
+        None,
+    ));
+    let identity = files.identity();
+    let admission = {
+        let mut state = authority.state.lock();
+        if let Some(record) = state.modules.iter().find(|record| {
+            record
+                .files
+                .as_ref()
+                .is_some_and(|current| current.identity() == identity)
+        }) {
+            reuse_snapshot(record).map(LoadSelection::Reuse)
+        } else {
+            reserve_load_record(authority, &mut state, &files, &fallback).map(LoadSelection::New)
+        }
+    }
+    .map_err(|(kind, failure)| module_error(kind, "reserve native load", failure))?;
+    match admission {
+        LoadSelection::New(operation) => Ok(LoadAdmission::New(operation)),
+        LoadSelection::Reuse(original) => {
+            compare_reuse(&original, &files)?;
+            recheck_reuse(authority, &original)?;
+            Ok(LoadAdmission::Reuse(original.view))
+        }
+    }
 }
 
 pub(super) fn authority_reserve_round(
@@ -90,7 +118,16 @@ pub(super) fn authority_prepare_unload(
     authority: &'static Authority,
     epoch: u64,
 ) -> Result<Option<SystemOperation>> {
-    todo!("阻止新调用，只有该模块全部轮次、代码和受控持有退出才可拿唯一系统引用。已释放可重放。")
+    let fallback = Arc::new(module_error(
+        ErrorKind::Internal,
+        "native release interrupted before confirmation",
+        None,
+    ));
+    let prepared = {
+        let mut state = authority.state.lock();
+        prepare_unload_record(authority, &mut state, epoch, &fallback)
+    };
+    prepared.map_err(|(kind, failure)| module_error(kind, "reserve native release", failure))
 }
 
 pub(super) fn authority_maintain(
@@ -163,21 +200,49 @@ pub(super) fn authority_record_mapping(
     epoch: u64,
     mapped: MappedIdentity,
 ) -> Result<()> {
-    todo!("以已有装入记录保存实际映像身份。发现相同实际映像已隔离时拒绝使用。后续即使兼容核验失败，也能明确归还或隔离相关映像。")
+    let recorded = {
+        let mut state = authority.state.lock();
+        record_mapping(&mut state, epoch, mapped)
+    };
+    recorded.map_err(|(kind, failure)| module_error(kind, "record native mapping", failure))
 }
 
 pub(super) fn system_epoch(operation: &SystemOperation) -> u64 {
-    todo!("读取预先登记的实际代际身份。")
+    operation.epoch
 }
 
 pub(super) fn system_open(operation: &mut SystemOperation) -> Result<()> {
-    todo!(
-        "系统调用前记进入；返回后先保存唯一引用或确定未获引用，再做可失败处理，整个过程不持短锁。"
-    )
+    if !matches!(operation.phase, SystemPhase::Reserved) {
+        return Err(module_error(
+            ErrorKind::InvalidState,
+            "open native reference",
+            None,
+        ));
+    }
+    operation.phase = SystemPhase::Opening;
+    match loader::open(&operation.files) {
+        Ok(module) => {
+            operation.library = Some(module);
+            operation.phase = SystemPhase::OwnsReference;
+            Ok(())
+        }
+        Err(failure) => {
+            let failure = Arc::new(failure);
+            confirm_no_reference(operation, Some(Arc::clone(&failure)));
+            Err(replay_module_failure(failure, "open native reference"))
+        }
+    }
 }
 
 pub(super) fn system_library(operation: &SystemOperation) -> Result<&NativeModule> {
-    todo!("仅在本次操作确实持有系统引用时借用。原持有不能在这次借用中消失。")
+    if let (SystemPhase::OwnsReference, Some(module)) = (&operation.phase, &operation.library) {
+        return Ok(module);
+    }
+    Err(module_error(
+        ErrorKind::InvalidState,
+        "borrow native reference",
+        None,
+    ))
 }
 
 pub(super) fn system_confirm_loaded(
@@ -185,16 +250,477 @@ pub(super) fn system_confirm_loaded(
     image: VerifiedImage,
     metadata: Metadata,
 ) -> Result<ModuleView> {
-    todo!("先完成发布所需准备。新模块将持有原子登记。发现已有相同实际模块时，沿同一规则在锁外核宿主元信息和新资料。差异经本次候选拒绝路径显式归还。相符时显式归还额外引用，确认后在短锁内清空候选映像标识并移出文件和映像资料，锁外结束原持有。复核已有模块为原代际、原资料和已装入状态之后才交付复用。释放未确认沿原合同处理。")
+    let mut operation = operation;
+    let authority = operation.authority;
+    let epoch = operation.epoch;
+    let image = Arc::new(image);
+    let metadata = Arc::new(metadata);
+    let confirmation = {
+        let mut state = operation.authority.state.lock();
+        publish_loaded(&mut state, &mut operation, &image, &metadata)
+    };
+    match confirmation {
+        Ok(LoadConfirmation::Published(obsolete_failure)) => {
+            drop(obsolete_failure);
+            Ok(ModuleView { epoch, metadata })
+        }
+        Ok(LoadConfirmation::Reuse(original)) => {
+            if let Err(failure) = compare_reuse(&original, &operation.files) {
+                return Err(operation.reject(failure));
+            }
+            operation.release()?;
+            recheck_reuse(authority, &original)?;
+            Ok(original.view)
+        }
+        Err((kind, failure)) => {
+            Err(operation.reject(module_error(kind, "publish native module", failure)))
+        }
+    }
 }
 
 pub(super) fn system_reject(operation: SystemOperation, cause: Error) -> Error {
-    todo!("已取得引用则明确尝试一次释放。未尝试或已确定无引用时按实际处理。保留原错误和真实结果。确认无系统引用时清空旧映像标识并从记录移出文件及映像资料，在锁外归还。释放不明时隔离已知同映像记录及候选版本，禁止使用相关旧地址。")
+    let mut operation = operation;
+    match operation.phase {
+        SystemPhase::OwnsReference => {
+            let original = Arc::new(cause);
+            let failure = replay_module_failure(Arc::clone(&original), "reject native load");
+            match release_reference(&mut operation, Some(original)) {
+                Ok(()) => failure,
+                Err(release_failure) => failure.attach(RecordedFailure(Arc::new(release_failure))),
+            }
+        }
+        SystemPhase::Reserved => {
+            let original = Arc::new(cause);
+            confirm_no_reference(&mut operation, Some(Arc::clone(&original)));
+            replay_module_failure(original, "reject native load")
+        }
+        SystemPhase::Opening | SystemPhase::ReleasingReference => {
+            let original = Arc::new(cause);
+            quarantine_mapping(&mut operation, Some(Arc::clone(&original)));
+            replay_module_failure(original, "unconfirmed native result")
+        }
+        SystemPhase::Finished => cause,
+    }
 }
 
 pub(super) fn system_release(operation: SystemOperation) -> Result<()> {
-    todo!("标准卸载的唯一释放入口。锁外消费真实引用并记录结果。确认释放成功时锁内清空旧映像标识，移出该记录的文件和映像资料，锁外结束它们的持有。保留原模块编号和已有结果供重放。失败或不明时禁止使用相关旧地址，保留占用和诊断。")
+    let mut operation = operation;
+    release_reference(&mut operation, None)
+}
+
+fn release_reference(
+    operation: &mut SystemOperation,
+    released_failure: Option<Arc<Error>>,
+) -> Result<()> {
+    if !matches!(operation.phase, SystemPhase::OwnsReference) {
+        return Err(module_error(
+            ErrorKind::InvalidState,
+            "release native reference",
+            None,
+        ));
+    }
+    let Some(module) = operation.library.take() else {
+        quarantine_mapping(operation, None);
+        return Err(module_error(
+            ErrorKind::Corrupted,
+            "release native reference",
+            None,
+        ));
+    };
+    operation.phase = SystemPhase::ReleasingReference;
+    match loader::close(module) {
+        Ok(()) => {
+            confirm_no_reference(operation, released_failure);
+            Ok(())
+        }
+        Err(failure) => {
+            let failure = Arc::new(failure);
+            quarantine_mapping(operation, Some(Arc::clone(&failure)));
+            Err(replay_module_failure(failure, "release native reference"))
+        }
+    }
 }
 pub(super) fn system_operation_drop(operation: &mut SystemOperation) {
-    todo!("在原登记中无分配归回仍明确拥有的引用，待显式维护。系统调用结果不明时保留原记录和占用，停用旧地址。已经确认无引用时只结束本地操作，实际文件和映像资料的持有按已确认分支在锁外结束。")
+    match operation.phase {
+        SystemPhase::Finished => {}
+        SystemPhase::Reserved => confirm_no_reference(operation, None),
+        SystemPhase::Opening | SystemPhase::ReleasingReference => {
+            quarantine_mapping(operation, None);
+        }
+        SystemPhase::OwnsReference => {
+            let mut state = operation.authority.state.lock();
+            if let Some(record) = state
+                .modules
+                .iter_mut()
+                .find(|record| record.epoch == operation.epoch)
+            {
+                if record.library.is_none() && operation.library.is_some() {
+                    record.library = operation.library.take();
+                    if !matches!(record.phase, ModulePhase::Quarantined) {
+                        record.phase = ModulePhase::AwaitingRelease;
+                    }
+                    operation.phase = SystemPhase::Finished;
+                    return;
+                }
+            }
+            drop(state);
+            quarantine_mapping(operation, None);
+        }
+    }
+}
+
+type ModuleFailure = (ErrorKind, Option<Arc<Error>>);
+
+fn module_error(kind: ErrorKind, operation: &'static str, failure: Option<Arc<Error>>) -> Error {
+    let result = Error::new(kind).attach(ErrorOperation(operation));
+    match failure {
+        Some(previous) => {
+            let copied = previous
+                .downcast_ref::<Arc<pi_ffi_core::diagnostic::CopiedDiagnostic>>()
+                .map(Arc::clone);
+            let result = result.attach(RecordedFailure(previous));
+            match copied {
+                Some(copied) => result.attach(copied),
+                None => result,
+            }
+        }
+        None => result,
+    }
+}
+
+#[derive(Debug)]
+struct RecordedFailure(Arc<Error>);
+
+impl std::fmt::Display for RecordedFailure {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.0.as_ref(), output)
+    }
+}
+
+fn replay_module_failure(failure: Arc<Error>, operation: &'static str) -> Error {
+    module_error(*failure.current_context(), operation, Some(failure))
+}
+
+fn issue_identifier(state: &mut State) -> std::result::Result<u64, ErrorKind> {
+    let id = state.next_identifier;
+    state.next_identifier = id.checked_add(1).ok_or(ErrorKind::ResourceExhausted)?;
+    Ok(id)
+}
+
+fn module_unavailable(record: &ModuleRecord) -> ModuleFailure {
+    match record.phase {
+        ModulePhase::Loading | ModulePhase::Unloading | ModulePhase::AwaitingRelease => {
+            (ErrorKind::Busy, None)
+        }
+        ModulePhase::Quarantined => {
+            let kind = record
+                .failure
+                .as_ref()
+                .map_or(ErrorKind::InvalidState, |failure| {
+                    *failure.current_context()
+                });
+            (kind, record.failure.clone())
+        }
+        ModulePhase::Loaded | ModulePhase::Released => (ErrorKind::InvalidState, None),
+    }
+}
+
+enum LoadSelection {
+    New(SystemOperation),
+    Reuse(ReuseSnapshot),
+}
+
+struct ReuseSnapshot {
+    view: ModuleView,
+    files: Arc<VerifiedFiles>,
+    image: Arc<VerifiedImage>,
+}
+
+fn reuse_snapshot(record: &ModuleRecord) -> std::result::Result<ReuseSnapshot, ModuleFailure> {
+    if !matches!(record.phase, ModulePhase::Loaded) {
+        return Err(module_unavailable(record));
+    }
+    let (Some(files), Some(metadata), Some(mapped), Some(image), Some(_)) = (
+        &record.files,
+        &record.metadata,
+        record.mapped,
+        &record.image,
+        &record.library,
+    ) else {
+        return Err((ErrorKind::Corrupted, None));
+    };
+    if mapped != image.identity {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    Ok(ReuseSnapshot {
+        view: ModuleView {
+            epoch: record.epoch,
+            metadata: Arc::clone(metadata),
+        },
+        files: Arc::clone(files),
+        image: Arc::clone(image),
+    })
+}
+
+fn compare_reuse(original: &ReuseSnapshot, candidate: &VerifiedFiles) -> Result<()> {
+    let actual = &original.view.metadata;
+    let approved = candidate.manifest();
+    if actual.uuid != approved.uuid || actual.version != approved.version {
+        return Err(
+            module_error(ErrorKind::Conflict, "match reused plugin metadata", None)
+                .attach(format!("实际 UUID（actual UUID） {:02x?}", actual.uuid))
+                .attach(format!("批准 UUID（approved UUID） {:02x?}", approved.uuid))
+                .attach(format!("实际版本（actual version） {}", actual.version))
+                .attach(format!("批准版本（approved version） {}", approved.version)),
+        );
+    }
+    if !original.files.matches_reuse(candidate) {
+        return Err(module_error(
+            ErrorKind::Conflict,
+            "match reused plugin deployment",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+fn recheck_reuse(authority: &Authority, original: &ReuseSnapshot) -> Result<()> {
+    let enrolled = {
+        let state = authority.state.lock();
+        state
+            .modules
+            .iter()
+            .find(|record| record.epoch == original.view.epoch)
+            .ok_or((ErrorKind::NotFound, None))
+            .and_then(|record| {
+                if !matches!(record.phase, ModulePhase::Loaded) {
+                    return Err(module_unavailable(record));
+                }
+                if record.library.is_none()
+                    || record.mapped != Some(original.image.identity)
+                    || !record
+                        .files
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &original.files))
+                    || !record
+                        .image
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &original.image))
+                    || !record
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &original.view.metadata))
+                {
+                    return Err((ErrorKind::InvalidState, None));
+                }
+                Ok(())
+            })
+    };
+    enrolled.map_err(|(kind, failure)| module_error(kind, "recheck loaded plugin reuse", failure))
+}
+
+fn reserve_load_record(
+    authority: &'static Authority,
+    state: &mut State,
+    files: &Arc<VerifiedFiles>,
+    fallback: &Arc<Error>,
+) -> std::result::Result<SystemOperation, ModuleFailure> {
+    state
+        .modules
+        .try_reserve(1)
+        .map_err(|_| (ErrorKind::ResourceExhausted, None))?;
+    let epoch = issue_identifier(state).map_err(|kind| (kind, None))?;
+    state.modules.push(ModuleRecord {
+        epoch,
+        files: Some(Arc::clone(files)),
+        mapped: None,
+        image: None,
+        library: None,
+        metadata: None,
+        phase: ModulePhase::Loading,
+        failure: Some(Arc::clone(fallback)),
+    });
+    Ok(SystemOperation {
+        authority,
+        epoch,
+        files: Arc::clone(files),
+        phase: SystemPhase::Reserved,
+        library: None,
+    })
+}
+
+fn record_mapping(
+    state: &mut State,
+    epoch: u64,
+    mapped: MappedIdentity,
+) -> std::result::Result<(), ModuleFailure> {
+    let record = state
+        .modules
+        .iter_mut()
+        .find(|record| record.epoch == epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    if !matches!(record.phase, ModulePhase::Loading) {
+        return Err(module_unavailable(record));
+    }
+    if record.mapped.is_some_and(|previous| previous != mapped) {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    record.mapped = Some(mapped);
+    if let Some(other) = state.modules.iter().find(|record| {
+        record.epoch != epoch
+            && record.mapped == Some(mapped)
+            && matches!(record.phase, ModulePhase::Quarantined)
+    }) {
+        return Err(module_unavailable(other));
+    }
+    Ok(())
+}
+
+enum LoadConfirmation {
+    Published(Option<Arc<Error>>),
+    Reuse(ReuseSnapshot),
+}
+
+fn publish_loaded(
+    state: &mut State,
+    operation: &mut SystemOperation,
+    image: &Arc<VerifiedImage>,
+    metadata: &Arc<Metadata>,
+) -> std::result::Result<LoadConfirmation, ModuleFailure> {
+    let epoch = operation.epoch;
+    let index = state
+        .modules
+        .iter()
+        .position(|record| record.epoch == epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    let record = &state.modules[index];
+    if !matches!(record.phase, ModulePhase::Loading) {
+        return Err(module_unavailable(record));
+    }
+    if record.mapped != Some(image.identity)
+        || !matches!(operation.phase, SystemPhase::OwnsReference)
+    {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    if let Some(other) = state.modules.iter().find(|record| {
+        record.epoch != epoch
+            && record.mapped == Some(image.identity)
+            && !matches!(record.phase, ModulePhase::Loading | ModulePhase::Released)
+    }) {
+        return reuse_snapshot(other).map(LoadConfirmation::Reuse);
+    }
+    let library = operation
+        .library
+        .take()
+        .ok_or((ErrorKind::Corrupted, None))?;
+    let record = &mut state.modules[index];
+    record.image = Some(Arc::clone(image));
+    record.metadata = Some(Arc::clone(metadata));
+    record.library = Some(library);
+    record.phase = ModulePhase::Loaded;
+    operation.phase = SystemPhase::Finished;
+    Ok(LoadConfirmation::Published(record.failure.take()))
+}
+
+fn prepare_unload_record(
+    authority: &'static Authority,
+    state: &mut State,
+    epoch: u64,
+    fallback: &Arc<Error>,
+) -> std::result::Result<Option<SystemOperation>, ModuleFailure> {
+    let record = state
+        .modules
+        .iter_mut()
+        .find(|record| record.epoch == epoch)
+        .ok_or((ErrorKind::NotFound, None))?;
+    match record.phase {
+        ModulePhase::Released => return Ok(None),
+        ModulePhase::Loaded => {}
+        _ => return Err(module_unavailable(record)),
+    }
+    if state
+        .rounds
+        .iter()
+        .any(|round| round.id.module_epoch == epoch && !matches!(round.phase, RoundPhase::Closed))
+        || state.sources.iter().any(|source| {
+            source.id.module_epoch == epoch && !matches!(source.state, SourceState::Retired)
+        })
+        || state.holdings.iter().any(|holding| {
+            holding.target.lease.initialization.module_epoch == epoch
+                && !matches!(holding.phase, HoldingPhase::Returned)
+        })
+        || state.calls.iter().any(|call| {
+            call.id.module_epoch == epoch
+                && !matches!(call.token, CallIdentifier::Source { active: false, .. })
+        })
+    {
+        return Err((ErrorKind::Busy, None));
+    }
+    if record.failure.is_some() {
+        return Err((ErrorKind::Corrupted, None));
+    }
+    let Some(files) = record.files.clone() else {
+        return Err((ErrorKind::Corrupted, None));
+    };
+    let Some(library) = record.library.take() else {
+        return Err((ErrorKind::Corrupted, None));
+    };
+    record.phase = ModulePhase::Unloading;
+    record.failure = Some(Arc::clone(fallback));
+    Ok(Some(SystemOperation {
+        authority,
+        epoch,
+        files,
+        phase: SystemPhase::OwnsReference,
+        library: Some(library),
+    }))
+}
+
+fn confirm_no_reference(operation: &mut SystemOperation, result: Option<Arc<Error>>) {
+    let files_and_image = {
+        let mut state = operation.authority.state.lock();
+        state
+            .modules
+            .iter_mut()
+            .find(|record| record.epoch == operation.epoch)
+            .map(|record| {
+                record.phase = ModulePhase::Released;
+                record.mapped = None;
+                let previous = std::mem::replace(&mut record.failure, result);
+                (record.files.take(), record.image.take(), previous)
+            })
+    };
+    operation.phase = SystemPhase::Finished;
+    drop(files_and_image);
+}
+
+fn quarantine_mapping(operation: &mut SystemOperation, failure: Option<Arc<Error>>) {
+    let previous = {
+        let mut state = operation.authority.state.lock();
+        let Some(record) = state
+            .modules
+            .iter_mut()
+            .find(|record| record.epoch == operation.epoch)
+        else {
+            operation.phase = SystemPhase::Finished;
+            return;
+        };
+        record.phase = ModulePhase::Quarantined;
+        let mapped = record.mapped;
+        let previous = failure.map(|failure| record.failure.replace(failure));
+        let retained = record.failure.clone();
+        if let Some(mapped) = mapped {
+            for other in &mut state.modules {
+                if other.epoch != operation.epoch && other.mapped == Some(mapped) {
+                    other.phase = ModulePhase::Quarantined;
+                    if other.failure.is_none() {
+                        other.failure = retained.clone();
+                    }
+                }
+            }
+        }
+        previous
+    };
+    operation.phase = SystemPhase::Finished;
+    drop(previous);
 }
