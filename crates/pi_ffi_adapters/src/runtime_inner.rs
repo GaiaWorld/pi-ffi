@@ -1,13 +1,16 @@
-// 不使用参数是设计占位（stub）的临时事实。
-#![allow(unused_variables, dead_code)]
-
 use super::*;
+use pi_ffi_abi::ObjectKeyV1;
+use pi_ffi_core::source::ExportedInterface;
 
 pub(super) fn publish<R>(connection: Connection, runtime: Arc<R>) -> Result<PublishedRuntime>
 where
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
 {
-    todo!("在本轮 Connection 附着来源，登记原 Arc<R>、只读表头和适配输入清理回调；成功立即包装 Object，失败由 B1 保留待归还责任")
+    let source = Arc::new(Registry::attach(connection)?);
+    // SAFETY: RUNTIME_TABLE 为本 Rust 适配库（adapter crate）登记 Arc<R> 使用的固定表。
+    let interface = unsafe { ExportedInterface::new::<RuntimeInterface>(&RUNTIME_TABLE) }?;
+    let object = source.export(runtime, vec![interface], |_| Ok(()))?;
+    Ok(PublishedRuntime { object, source })
 }
 
 pub(super) fn install_input<'scope>(
@@ -15,29 +18,81 @@ pub(super) fn install_input<'scope>(
     input: &ObjectRefV1,
     slot: &'scope RefCell<Option<InitializationInput>>,
 ) -> RestoreInput<'scope> {
-    todo!("从受保护输入逐字段复制完整 LeaseV1，连同同一实际 Registry 安装于本线程槽位；把上一记录移给恢复守卫，返回前结束短期可变借用")
+    let lease = &input.lease;
+    let previous = slot.replace(Some(InitializationInput {
+        lease: LeaseV1 {
+            object: ObjectKeyV1 {
+                source: lease.object.source,
+                slot: lease.object.slot,
+                generation: lease.object.generation,
+            },
+            initialization: pi_ffi_abi::InitIdV1 {
+                module_epoch: lease.initialization.module_epoch,
+                round: lease.initialization.round,
+            },
+            holding: lease.holding,
+        },
+        source: published.source.clone(),
+    }));
+    RestoreInput { slot, previous }
 }
 
 pub(super) fn source_for_input(
     connection: &Connection,
     input: &ObjectRefV1,
 ) -> Result<Arc<Registry>> {
-    todo!("只检查当前线程最内层记录和完整 LeaseV1，槽位不可用报 InvalidState，缺失或不符报 Conflict；核连接轮次，不符报 Conflict；在返回源引用前结束槽位借用")
+    let source = CURRENT_INPUT
+        .try_with(|slot| {
+            let record = slot
+                .try_borrow()
+                .map_err(|_| Error::new(ErrorKind::InvalidState))?;
+            record
+                .as_ref()
+                .filter(|record| same_lease(&record.lease, &input.lease))
+                .map(|record| record.source.clone())
+                .ok_or_else(|| Error::new(ErrorKind::Conflict))
+        })
+        .map_err(|_| Error::new(ErrorKind::InvalidState))??;
+    let round = connection.initialization();
+    if round.module_epoch != input.lease.initialization.module_epoch
+        || round.round != input.lease.initialization.round
+    {
+        return Err(Error::new(ErrorKind::Conflict));
+    }
+    Ok(source)
 }
 
 pub(super) fn with_runtime_result<V>(
     result: Result<()>,
     output: Option<V>,
 ) -> RawResult<V, (Error, Option<V>)> {
-    todo!("B1 失败时原样交付 pi_result 和可能已有的原值；确认成功时交付原值，反常成功却缺失原值时报告 Corrupted")
+    match (result, output) {
+        (Ok(()), Some(output)) => Ok(output),
+        (Ok(()), None) => Err((Error::new(ErrorKind::Corrupted), None)),
+        (Err(error), output) => Err((error, output)),
+    }
 }
 
 pub(super) fn clone_runtime<R>(runtime: &Runtime<R>) -> Runtime<R> {
-    todo!("共享现有 Interface 的本地拥有者及同一 Registry，不建立独立 C 持有")
+    Runtime {
+        interface: runtime.interface.clone(),
+        source: runtime.source.clone(),
+        runtime: PhantomData,
+    }
 }
 
 pub(super) fn restore_input(restore: &mut RestoreInput<'_>) {
-    todo!("利用守卫已借用的槽位恢复原记录，短期借用结束后释放换出的记录，不从 TLS 再查询或调用外部代码")
+    let replaced = restore.slot.replace(restore.previous.take());
+    drop(replaced);
+}
+
+fn same_lease(left: &LeaseV1, right: &LeaseV1) -> bool {
+    left.object.source == right.object.source
+        && left.object.slot == right.object.slot
+        && left.object.generation == right.object.generation
+        && left.initialization.module_epoch == right.initialization.module_epoch
+        && left.initialization.round == right.initialization.round
+        && left.holding == right.holding
 }
 
 pub(super) fn view_create_with_config<R: TaskDispatch, F, M>(
@@ -50,14 +105,14 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("调用 `R::create_with_config` 一次，按其原生契约交付参数与结果")
+    R::create_with_config(runtime, future, config)
 }
 
 pub(super) fn view_submit<R: TaskDispatch>(
     runtime: &R,
     task: UnsubmittedTask,
 ) -> RawResult<(), SubmitError> {
-    todo!("调用 `R::submit` 一次，按其原生契约交付参数与结果")
+    R::submit(runtime, task)
 }
 
 pub(super) fn view_create<R: TaskDispatch, F>(
@@ -68,7 +123,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    todo!("调用 `R::create` 一次，按其原生契约交付参数与结果")
+    R::create(runtime, future)
 }
 
 pub(super) fn view_spawn_with_config<R: TaskDispatch, F, M>(
@@ -81,7 +136,7 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("调用 `R::spawn_with_config` 一次，按其原生契约交付参数与结果")
+    R::spawn_with_config(runtime, future, config)
 }
 
 pub(super) fn view_spawn<R: TaskDispatch, F>(
@@ -92,14 +147,14 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    todo!("调用 `R::spawn` 一次，按其原生契约交付参数与结果")
+    R::spawn(runtime, future)
 }
 
 pub(super) fn view_submit_idle<R: IdleDispatch>(
     runtime: &R,
     task: UnsubmittedTask,
 ) -> RawResult<(), SubmitError> {
-    todo!("调用 `R::submit_idle` 一次，按其原生契约交付参数与结果")
+    R::submit_idle(runtime, task)
 }
 
 pub(super) fn view_idle_with_config<R: IdleDispatch, F, M>(
@@ -112,7 +167,7 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("调用 `R::idle_with_config` 一次，按其原生契约交付参数与结果")
+    R::idle_with_config(runtime, future, config)
 }
 
 pub(super) fn view_idle<R: IdleDispatch, F>(
@@ -123,7 +178,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    todo!("调用 `R::idle` 一次，按其原生契约交付参数与结果")
+    R::idle(runtime, future)
 }
 
 pub(super) fn view_idle_local_with_config<R: IdleDispatch, F, M>(
@@ -135,7 +190,7 @@ where
     F::Output: Send + 'static,
     M: Send + Sync + 'static,
 {
-    todo!("调用 `R::idle_local_with_config`，遵守提供方当前本地环境规则")
+    R::idle_local_with_config(future, config)
 }
 
 pub(super) fn view_idle_local<R: IdleDispatch, F>(
@@ -145,11 +200,11 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    todo!("调用 `R::idle_local`，遵守提供方当前本地环境规则")
+    R::idle_local(future)
 }
 
 pub(super) fn view_timeout<R: RuntimeTime>(runtime: &R, duration: Duration) -> Timeout<R::Timer> {
-    todo!("调用 `R::timeout` 一次，按其原生契约交付参数与结果")
+    R::timeout(runtime, duration)
 }
 
 pub(super) fn view_timeout_on<R: RuntimeTime, F: Future>(
@@ -157,78 +212,108 @@ pub(super) fn view_timeout_on<R: RuntimeTime, F: Future>(
     future: F,
     duration: Duration,
 ) -> TimeoutOn<R::Timer, F> {
-    todo!("调用 `R::timeout_on` 一次，按其原生契约交付参数与结果")
+    R::timeout_on(runtime, future, duration)
 }
 
 pub(super) fn view_sleep<R: RuntimeTime>(runtime: &R, duration: Duration) -> Sleep<R::Timer> {
-    todo!("调用 `R::sleep` 一次，按其原生契约交付参数与结果")
+    R::sleep(runtime, duration)
 }
 
 pub(super) fn view_wait_one_timeout<R: RuntimeWait, T>(
     runtime: &R,
     duration: Duration,
 ) -> (WaitOneTimeout<R::Timer, T>, OneSender<T>) {
-    todo!("调用 `R::wait_one_timeout` 一次，按其原生契约交付参数与结果")
+    R::wait_one_timeout(runtime, duration)
 }
 
 pub(super) fn view_wait_any_timeout<R: RuntimeWait, T>(
     runtime: &R,
     duration: Duration,
 ) -> (WaitAnyTimeout<R::Timer, T>, AnySender<T>) {
-    todo!("调用 `R::wait_any_timeout` 一次，按其原生契约交付参数与结果")
+    R::wait_any_timeout(runtime, duration)
 }
 
 pub(super) fn view_wait_all_timeout<R: RuntimeWait, T>(
     runtime: &R,
     duration: Duration,
 ) -> (WaitAllTimeout<R::Timer, T>, AllSender<T>) {
-    todo!("调用 `R::wait_all_timeout` 一次，按其原生契约交付参数与结果")
+    R::wait_all_timeout(runtime, duration)
 }
 
 pub(super) fn view_id<R: RuntimeQuery>(runtime: &R) -> RuntimeId {
-    todo!("调用 `R::id` 一次，按其原生契约交付参数与结果")
+    R::id(runtime)
 }
 
 pub(super) fn view_status<R: RuntimeQuery>(runtime: &R) -> RuntimeStatus {
-    todo!("调用 `R::status` 一次，按其原生契约交付参数与结果")
+    R::status(runtime)
 }
 
 pub(super) fn view_is_driving<R: RuntimeQuery>(runtime: &R) -> bool {
-    todo!("调用 `R::is_driving` 一次，按其原生契约交付参数与结果")
+    R::is_driving(runtime)
 }
 
 pub(super) fn view_last_idle_state<R: RuntimeQuery>(runtime: &R) -> IdleState {
-    todo!("调用 `R::last_idle_state` 一次，按其原生契约交付参数与结果")
+    R::last_idle_state(runtime)
 }
 
 pub(super) fn view_close_state<R: RuntimeQuery>(runtime: &R) -> CloseState {
-    todo!("调用 `R::close_state` 一次，按其原生契约交付参数与结果")
+    R::close_state(runtime)
 }
 
 pub(super) fn view_external_task_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::external_task_count` 一次，按其原生契约交付参数与结果")
+    R::external_task_count(runtime)
 }
 
 pub(super) fn view_internal_task_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::internal_task_count` 一次，按其原生契约交付参数与结果")
+    R::internal_task_count(runtime)
 }
 
 pub(super) fn view_timer_registration_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::timer_registration_count` 一次，按其原生契约交付参数与结果")
+    R::timer_registration_count(runtime)
 }
 
 pub(super) fn view_idle_task_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::idle_task_count` 一次，按其原生契约交付参数与结果")
+    R::idle_task_count(runtime)
 }
 
 pub(super) fn view_in_flight_task_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::in_flight_task_count` 一次，按其原生契约交付参数与结果")
+    R::in_flight_task_count(runtime)
 }
 
 pub(super) fn view_waiting_for_wake_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::waiting_for_wake_count` 一次，按其原生契约交付参数与结果")
+    R::waiting_for_wake_count(runtime)
 }
 
 pub(super) fn view_pending_cancel_task_count<R: RuntimeQuery>(runtime: &R) -> usize {
-    todo!("调用 `R::pending_cancel_task_count` 一次，按其原生契约交付参数与结果")
+    R::pending_cancel_task_count(runtime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 原生返回值（native result）和 B1 调用保护的结果分别保留。
+    #[test]
+    fn test_runtime_result_preserves_native_output_and_cleanup_error() {
+        let value = String::from("原生返回值（native result）");
+        let original = Err::<(), _>(&value);
+        let successful_access = with_runtime_result(Ok(()), Some(original)).unwrap();
+        assert!(std::ptr::eq(successful_access.unwrap_err(), &value));
+
+        let cleanup_failure = Error::new(ErrorKind::Io).attach(27u32);
+        let (error, returned) =
+            with_runtime_result(Err(cleanup_failure), Some(original)).unwrap_err();
+        assert_eq!(error.current_context(), &ErrorKind::Io);
+        assert_eq!(error.downcast_ref::<u32>(), Some(&27));
+        assert!(std::ptr::eq(returned.unwrap().unwrap_err(), &value));
+
+        let refused = Error::new(ErrorKind::Busy);
+        let (error, returned) = with_runtime_result::<()>(Err(refused), None).unwrap_err();
+        assert_eq!(error.current_context(), &ErrorKind::Busy);
+        assert_eq!(returned, None);
+
+        let (error, returned) = with_runtime_result::<()>(Ok(()), None).unwrap_err();
+        assert_eq!(error.current_context(), &ErrorKind::Corrupted);
+        assert_eq!(returned, None);
+    }
 }
