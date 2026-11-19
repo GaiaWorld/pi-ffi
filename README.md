@@ -1,17 +1,18 @@
 # pi-ffi
 
-`pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、初始化、维护、关闭和卸载符合约定的 Rust 插件动态库（plugin dynamic library），并安全交接初始化输入，支持运行时（runtime）替换。插件提供的业务服务（business service）对本库完全透明。
+`pi-ffi` 是面向跨平台（cross-platform）、多进程（multi-process）插件系统（plugin system）的上游支持库，负责查找、识别、加载、初始化、维护、关闭和卸载符合约定的 Rust 插件动态库（plugin dynamic library），安全交接初始化入参并支持运行时（runtime）替换。本库提供插件在标准初始化时汇总并登记其静态服务（static service）的接入。
 
-**当前处于设计阶段，尚无可用的完整接入接口（API）。** 下文区分已经对齐的使用约定和仍需设计的具体表示；已有 Rust、Cargo 与 `pi_result` 接口（API）的示例可以单独验证，不能据此推断本项目已经实现或通过验收。
+**当前仓库包含设计骨架（design skeleton）。** 四个运行期库和可选编译期宏提供接口声明。实现中的 `todo!()` 会触发恐慌（panic）。本页手工封装示例已核对 Rust 类型和 Linux 导出；宏展开与运行验证在实现完成后进行。
 
-共同外部函数接口（FFI）及 Rust 壳（shell）已经冻结，并生成两个基础库（foundation crate）：
+工作区（workspace）各库的职责如下。
 
 | 库（crate） | 当前职责 |
 | --- | --- |
 | [pi_ffi_abi](crates/pi_ffi_abi/src/lib.rs) | 固定 C 表示、身份／轮次／持有、诊断和共同操作表；不依赖业务库 |
 | [pi_ffi_core](crates/pi_ffi_core/src/lib.rs) | `boundary`、`control`、`diagnostic`、`object`、`source` 五模块的安全封装与来源管理声明 |
-
-`pi_ffi_core` 当前包含 65 处 `todo!` 未实现桩（unimplemented stub）。构建与公开文档生成已通过，运行行为尚未实现；调用这些桩会触发恐慌（panic），不能将当前骨架用于实际插件接入。运行时（runtime）、配置（Config）、P2P 服务终端（P2P service terminal）的输入封装和完整加载管理库将在后续设计批次中补齐。
+| [pi_ffi_adapters](crates/pi_ffi_adapters/src/lib.rs) | 运行时（runtime）、配置（Config）和 P2P 终端（terminal）的接入 |
+| [pi_ffi](crates/pi_ffi/src/lib.rs) | 宿主（host）管理和插件的三个标准入口 |
+| [pi_ffi_macros](crates/pi_ffi_macros/src/lib.rs) | 可选过程宏（procedural macro），在编译期生成标准导出 |
 
 ## 支持范围与职责
 
@@ -22,60 +23,60 @@
 | 参与方 | 负责内容 |
 | --- | --- |
 | 宿主（host） | 选择可信且遵守约定的外部产物，提供必传的 `pi-p2p-service` 终端实例（terminal instance）及 `pi_config::Config`，可选提供运行时（runtime）。通过既有服务框架提供发现、访问和跨进程通信（inter-process communication） |
-| 本库 | 管理动态库（dynamic library）的加载、版本接纳、同步管理调用（management call）、生命周期（lifecycle）及初始化输入的安全交接与释放 |
-| 插件动态库（plugin dynamic library）的实现方 | 提供标准管理入口，使用注入能力自行管理任务（task）、业务服务（business service）和资源；通过既有服务框架完成业务接口（business API）的声明、封装、汇总、注册、加载、调用和退出；遵守初始化、幂等性（idempotency）、错误、恐慌（panic）及清理约定 |
+| 本库 | 管理动态库（dynamic library）的加载、版本接纳、同步管理调用（management call）、生命周期（lifecycle）及初始化入参的安全交接与释放；提供插件标准初始化中汇总并登记静态声明的 Rust 接口 |
+| 插件动态库（plugin dynamic library）的实现方 | 提供标准管理入口，使用注入能力自行管理任务（task）、业务服务（business service）和资源；负责业务声明、实现、启动、动态注册、调用及退出；遵守初始化、幂等性（idempotency）、错误、恐慌（panic）及清理约定 |
 
 进程间通信（IPC）、QUIC 以及发现、连接和访问设施均由宿主（host）与既有服务框架提供，本项目不实现这些设施。对不可信原生代码（native code）的安全隔离（security isolation）也由外部宿主（host）承担。
 
-业务服务（business service）采用静态服务（static service）或动态服务（dynamic service），由插件实现方与既有服务框架选择和实现，本库不读取业务接口（business API）或服务集合。服务运行受传入的 P2P 服务终端（P2P service terminal）及既有框架约束；动态库（dynamic library）加载或初始化时可能触发插件内部静态声明的汇总和注册。这些动作在插件／框架内完成，不要求本库或宿主应用为每项服务接线。
+插件可以没有服务，也可以使用静态服务（static service）或动态服务（dynamic service）。插件在标准初始化时汇总本插件的静态声明，并交给既有服务框架登记。空集合也可使用相同入口。服务的实现和使用由插件负责，并依照传入的 P2P 服务终端（P2P service terminal）与原框架的约定。封装者通过 `pi_ffi::service::register_static` 把本插件完整的静态声明交给配用框架，在本轮保留真实登记标识并在关闭时撤回。共享终端上的框架须具备批量登记、撤回与确认引用退出的能力。
 
 运行时（runtime）替换属于本轮最小可行产品（MVP）目标。当前设计直接以 `../pi-async-rt_v1.0` 的核心库 `pi-async-runtime-core` 为基准；宿主封装（host wrapper）按标准特征（trait）接纳线程安全共享实例，包括符合合同的阻塞运行时（blocking runtime）或运行时池（runtime pool）。本库提供共享持有与克隆（clone），不要求原实例实现 `Clone`，也不绑定具体 `ConcurrentRuntime` 类型（type）。本轮不为旧 `../pi-async-rt` 实施接入后端（backend）；已有服务框架的实际依赖（dependency）仍需分别接线和验证。
 
-提供运行时（runtime）时，所需能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。普通跨库异步计算（Future）采用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）保留为运行时（runtime）内部合法上下文（context）中的用途，不作为本库当前必需显式输入约束，也不承诺跨库提交非 `Send` 工作；独立构建的上下文接线仍须核实。空闲提交接受不保证执行；等待、取消请求（cancellation request）及最终清理分别表达。
+提供运行时（runtime）时，所需能力为普通任务派发（TaskDispatch）、空闲派发（IdleDispatch）、计时（RuntimeTime）、等待（RuntimeWait）及查询（RuntimeQuery）。插件普通任务（task）的异步计算（Future）按原生 Rust 派发合同使用 `Send + 'static`，不额外要求 `Sync` 或 `Unpin`。本地任务派发（LocalTaskDispatch）用于原有本地上下文（context），合法条件由运行时库（runtime library）规定。空闲提交、等待、取消请求（cancellation request）及结果处理沿用运行时库的 Rust 接口（API）。
 
 每轮初始化固定运行时（runtime）的有无及所提供的实例。新轮或新版本可以提供另一实例，也可以省略该输入。在途异步计算（Future）仍在原实例完成或收尾。外部运行时（runtime）的实际拥有方负责创建、推进、保持可用和关闭实例。
 
-本库经安全 Rust 封装透传外部运行时（runtime）的有无。提供实例时，本库交接其使用能力，负责跨库表示、访问校验以及调用和引用的有效期。插件动态库（plugin dynamic library）自行决定用法并在关闭时收尾自己的工作。
+本库经安全 Rust 封装透传外部运行时（runtime）的有无。提供实例时，宿主（host）与插件（plugin）使用同一运行时库（runtime library）及其匹配的 Rust 接口（API）。pi-ffi 负责将宿主提供的实际实例安全交接给插件。插件动态库（plugin dynamic library）自行使用该实例并在关闭时收尾自己的工作。C 接口（C API）只用于 pi-ffi 的外部函数接口（FFI）边界。
 
-本库依据插件的标准关闭结果及相关跨库引用判断是否可卸载（unloadable）。共享运行时（runtime）可继续为其他使用者工作。若仍有在途调用（in-flight call）或引用依赖插件代码，本库保留相应映射并按约定返回 Busy 或失败。运行时查询（RuntimeQuery）供插件显式调用。具体封装接口（API）仍在设计中。
+本库依据插件的标准关闭结果及相关跨库引用判断是否可卸载（unloadable）。共享运行时（runtime）可继续为其他使用者工作。若仍有在途调用（in-flight call）或引用依赖插件代码，本库保留相应映射并按约定返回 Busy 或失败。运行时查询（RuntimeQuery）供插件自己的 Rust 代码显式调用。
 
 ## 标准入口与初始化输入
 
-当前标准对外提供以下三类同步管理入口。具体名称、类型（type）、布局（layout）、所有权（ownership）交接及完整返回格式尚未冻结。业务服务（business service）通过既有服务框架提供，不属于这些管理入口。
+宿主（host）和插件（plugin）均使用 Rust 实现。pi-ffi 定义以下三个同步管理入口的签名（signature）和语义（semantics），插件动态库（plugin dynamic library）用 Rust 实现并导出这三个 C 接口（C API）。封装者按本库的标准、规范和公开 Rust 接口（API）手工接入，或用可选过程宏（procedural macro）生成同样的三个导出。业务服务（business service）通过既有服务框架提供。
 
 | 入口 | 已对齐的使用约定 |
 | --- | --- |
-| 只读元信息（read-only metadata）查询 | 提供稳定身份声明及完整语义化版本号（semantic version）；在合法加载期间的初始化前、中、后及关闭期间、关闭后都可查询，不以业务初始化为前提 |
-| 初始化 | 接收必传的 `pi-p2p-service` 终端实例（terminal instance）、`pi_config::Config` 及可选的外部运行时（runtime）。明确返回成功或失败，并交付本次初始化的标识（initialization identifier），包括需要继续清理的失败情况 |
-| 关闭、清理与释放 | 接收本次初始化的标识（initialization identifier），明确返回成功或失败；旧标识（identifier）的延迟调用不能关闭新一轮使用 |
+| `pi_ffi_metadata_v1` 只读元信息（read-only metadata） | 提供稳定身份声明及完整语义化版本号（semantic version）；在合法加载期间的初始化前、中、后及关闭期间、关闭后都可查询，不以业务初始化为前提 |
+| `pi_ffi_initialize_v1` 初始化 | 接收必传的 `pi-p2p-service` 终端实例（terminal instance）、`pi_config::Config` 及可选的外部运行时（runtime）。返回实际初始化进度以及共同结果。宿主准备输入时已获得本轮标识（initialization identifier），需要继续清理时按原标识关闭 |
+| `pi_ffi_close_v1` 关闭 | 接收本次初始化的标识（initialization identifier），明确返回成功或失败；旧标识（identifier）的延迟调用不能关闭新一轮使用 |
 
-外部函数接口（FFI）采用目标平台的 C 应用二进制接口（C ABI）和受控表示。上述 `pi_config::Config` 是已经确定的输入对象；其跨库表示仍需设计，不能直接把任意 Rust 对象地址当作可互操作的参数。`repr(C)` 本身也不会使其内部嵌套的任意 Rust 类型（type）具备稳定表示。参见 [Rust 类型布局（type layout）说明](https://doc.rust-lang.org/reference/type-layout.html#representations)。
+外部函数接口（FFI）采用目标平台的 C 应用二进制接口（C ABI）和受控表示。运行时（runtime）可省略，终端（terminal）和配置（Config）必传。由标准 Rust 接入核对本轮登记并接收真实对象，`Config` 在同一轮只移交一次。`repr(C)` 本身也不会使其内部嵌套的任意 Rust 类型（type）具备稳定表示。参见 [Rust 类型布局（type layout）说明](https://doc.rust-lang.org/reference/type-layout.html#representations)。
 
-标准入口名称区分协议主版本（protocol major version）；同一主版本内固定调用约定（calling convention）及参数、返回值的布局（layout）。不兼容变化使用新的入口版本（entry version），它与外部产物自身的业务版本（business version）分别判断。正式名称及声明将在设计冻结后补充。
+标准入口名称区分协议主版本（protocol major version）；同一主版本内固定调用约定（calling convention）及参数、返回值的布局（layout）。不兼容变化使用新的入口版本（entry version），它与外部产物自身的业务版本（business version）分别判断。完整声明见 [三个标准 C 接口](crates/pi_ffi_abi/src/management.rs)。
 
 ### 身份、版本与反复使用
 
 - 稳定身份不因文件改名、复制或发布不同版本而改变。同一进程（process）中，相同身份与相同完整语义化版本号（semantic version）最多存在一个已经初始化的实例（instance）。
 - 完整版本包含构建元信息（build metadata）；例如 `1.2.3+build.1` 与 `1.2.3+build.2` 在本项目中用于区分不同实例版本（instance version）。版本优先级（version precedence）、范围匹配（range matching）与实例区分分别处理，不能把它们混为同一比较规则。[语义化版本规范（Semantic Versioning）](https://semver.org/spec/v2.0.0.html)规定构建元信息（build metadata）不参与版本优先级（version precedence）。
-- 初始化前检查所要求的版本范围（version range），不匹配则不进行业务初始化。具体范围语法尚未选定。系统加载可能已经执行构造器（constructor）；初始化前检查不表示此前没有执行外部代码。
+- 初始化前检查所要求的版本范围（version range），不匹配则不进行业务初始化。范围使用 `pi_ffi::host::VersionReq`。系统加载可能已经执行构造器（constructor）；初始化前检查不表示此前没有执行外部代码。
 - 同一进程（process）内重复加载同一实际模块（loaded module）时，共享其本轮实际初始化；输入冲突不能靠再次初始化解决。标准入口自身必须具有语义幂等性（semantic idempotency）。
 - 关闭失败时保留必要的代码映射（code mapping）和同版本占用，仅在安全前提满足时继续尚未完成的清理。超时不等于后台工作已经停止。
 - 再次初始化必须等本轮清理成功，且旧业务工作与调用资格已经退出或失效。最终卸载（unloading）还须等待所有需要代码映射（code mapping）的引用退出；只读查询及其返回数据也受此约束。
 - 关闭插件时按约定归还本轮对实际输入取得的跨库持有。共享运行时（runtime）由其外部拥有方继续管理。
 
-不同版本使用不同文件，并不能消除共享依赖（shared dependency）、符号（symbol）、配置（configuration）、文件、端口等资源冲突。本库对受控能力提供守护；实现方仍须正确获取、使用和释放其私有逻辑涉及的资源。具体逐项检查与守护边界仍需冻结。
+不同版本使用不同文件，并不能消除共享依赖（shared dependency）、符号（symbol）、配置（configuration）、文件、端口等资源冲突。本库对受控能力提供守护；实现方仍须正确获取、使用和释放其私有逻辑涉及的资源。外部配套构建和部署提供制品声明，本库核对文件、直接导出、实际映像及有关依赖；业务资源由插件及框架各自管理。
 
 释放系统加载句柄（loader handle）不保证所有平台立即完成物理卸载（physical unloading）或重置静态状态（static state）。参见 [Windows `FreeLibrary`](https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-freelibrary) 与 [POSIX `dlclose`](https://pubs.opengroup.org/onlinepubs/9799919799/functions/dlclose.html)。若反复使用确实遇到当前无法可靠解决的保留状态问题，将依据真实证据讨论限制；目前没有采用“同版本仅能使用一次”的普遍限制。
 
 ### 共享持有（shared holding）与释放责任
 
-共同对象合同及基础 Rust 接口（API）已经冻结。运行时（runtime）、配置（Config）和服务的具体能力仍在设计中。真实对象留在来源侧，已提供的初始化输入通过受控 C 表关联同一宿主管理接口（host management interface）及同一初始化轮次。普通使用者通过 Rust 封装访问这些能力。
+共同对象合同及基础 Rust 接口（API）已经冻结。已提供的初始化输入通过受控 C 表关联同一宿主管理接口（host management interface）及同一初始化轮次。插件通过 Rust 封装取得原生终端与运行时的共享持有，以及本轮原生 `Config` 的所有权。
 
 本地克隆（Clone）共享一个拥有者；需要另一份独立持有（independent holding）时，必须显式取得。每份独立持有在对外交付前，宿主（host）就已登记剩余释放义务及所需代码保活。最后一个本地拥有者结束时，只提交这条已有记录；提交不临时分配记录，也不执行来源回调（source callback）。宿主（host）随后推进真实释放，最终失败保留在管理状态与关闭结果中。
 
 例如，最后一个本地拥有者销毁时，另一个线程仍在执行一次已经获准的调用：释放提交可以成功，但关闭仍须返回忙碌（Busy），直到该调用退出、真实清理完成。**提交成功、持有归还和清理完成分别判断。** 不能只依据 `Drop` 已执行就释放动态库（dynamic library）的代码映射（code mapping）。
 
-后续正式接入示例将给出管理推进及最终关闭的实际调用；当前尚无可直接运行的本库接口（API）示例。安全 Rust 也允许通过 `mem::forget` 跳过析构（Drop），因此遗忘拥有者可能延后卸载（unloading），不能强制清零来绕过它。依据为 [Rust 关于遗忘与安全的说明](https://doc.rust-lang.org/1.100.0/std/mem/fn.forget.html#safety)。
+宿主可调用 `Manager::maintain` 有界推进已登记的释放。安全 Rust 也允许通过 `mem::forget` 跳过析构（Drop），因此遗忘拥有者可能延后卸载（unloading），不能强制清零来绕过它。依据为 [Rust 关于遗忘与安全的说明](https://doc.rust-lang.org/1.100.0/std/mem/fn.forget.html#safety)。
 
 析构（Drop）的提交路径只返回有限的 `pi_result` 分类投影，不创建新的错误报告（Report）。显式 `Object::release` 在最后一个本地拥有者需要提交时，再于允许分配的返回路径形成 `pi_result`；有其它本地别名时仅结束当前别名。最终清理是否完成，仍由宿主管理状态与关闭结果说明。
 
@@ -86,6 +87,152 @@
 接入封装在原调用已经提供的代码与上下文（context）保护内，复制同一来源的诊断，再显式归还；这条归还路径不放入析构（Drop）。来源已经拥有自己的宿主连接，由它先提交该诊断预登记的释放记录，再确认归还。重复提交已有记录不增加任务，也不即时执行来源回调（source callback）。
 
 来源、上下文（context）或轮次不匹配的返回值按损坏（Corrupted）拒绝读取，不尝试解引用未经保护的地址。已有释放责任及代码持有保留，不能把拒绝读取当作已经完成清理。标准来源的代码保护、逐次访问核验与独立持有须同时满足；只检查指针非空并不充分。
+
+## 接入代码（Integration）
+
+将插件包装写在自己的 Rust 库中。用 `cdylib` 产出操作系统可装入的动态库（dynamic library）。两侧使用同一套配套构建（matching build），包括工具链（toolchain）、目标、Cargo 解算结果、分配器（allocator）、Rust 共享适配库及实际依赖。宿主用完整制品清单（build manifest）描述目标、稳定 UUID、完整版本、文件摘要、预期装入的依赖和静态声明归属。
+
+下列路径按仓库在磁盘上的实际位置调整。示例使用真实 P2P 终端类型，保留必传配置，省略运行时（runtime），静态集合为空。
+
+```toml
+[package]
+name = "example-plugin"
+version = "1.2.3"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+pi_ffi = { path = "../pi-ffi/crates/pi_ffi" }
+pi_result = { path = "../pi_result" }
+pi_p2p_service = { path = "../pi-p2p-service" }
+```
+
+### 手工封装（Manual wrapping）
+
+```rust
+use pi_ffi::{
+    abi::{
+        CloseFnV1, InitIdV1, InitReplyV1, InitializeFnV1, MetadataFnV1, MetadataV1, ObjectRefV1,
+        OutcomeV1,
+    },
+    plugin::{Declaration, Exports, Inputs},
+};
+use pi_p2p_service::P2pServiceTerminal;
+use pi_result::Result;
+
+type PluginInputs = Inputs<P2pServiceTerminal>;
+
+const DECLARATION: Declaration = Declaration {
+    uuid: [
+        0x29, 0x57, 0x00, 0x98, 0xaa, 0x48, 0x46, 0x8c,
+        0xb5, 0x12, 0x63, 0xc2, 0x6b, 0x24, 0xa9, 0x31,
+    ],
+    version: env!("CARGO_PKG_VERSION"),
+};
+
+static EXPORTS: Exports<PluginInputs> = Exports::new(DECLARATION);
+
+fn initialize(inputs: PluginInputs, state: &mut Option<PluginInputs>) -> Result<()> {
+    *state = Some(inputs);
+    Ok(())
+}
+
+fn close(state: &mut Option<PluginInputs>) -> Result<()> {
+    drop(state.take());
+    Ok(())
+}
+
+// 遵约宿主保活模块并提供独占的输出槽。
+#[unsafe(no_mangle)]
+unsafe extern "C" fn pi_ffi_metadata_v1(out: *mut MetadataV1) -> OutcomeV1 {
+    unsafe { EXPORTS.metadata(out) }
+}
+
+// 遵约宿主保活同一轮的输入至调用返回。
+#[unsafe(no_mangle)]
+unsafe extern "C" fn pi_ffi_initialize_v1(
+    runtime: *const ObjectRefV1,
+    terminal: *const ObjectRefV1,
+    config: *const ObjectRefV1,
+) -> InitReplyV1 {
+    unsafe { EXPORTS.initialize_without_runtime(runtime, terminal, config, initialize) }
+}
+
+// 遵约宿主保活模块，并按原轮次发出关闭请求。
+#[unsafe(no_mangle)]
+unsafe extern "C" fn pi_ffi_close_v1(id: InitIdV1) -> OutcomeV1 {
+    unsafe { EXPORTS.close(id, close) }
+}
+
+const _: MetadataFnV1 = pi_ffi_metadata_v1;
+const _: InitializeFnV1 = pi_ffi_initialize_v1;
+const _: CloseFnV1 = pi_ffi_close_v1;
+```
+
+保留所选 UUID 供后续版本使用。真实封装在产生资源或静态登记等效果前保留本轮可用于关闭的状态。关闭时按本轮记录停止接纳、撤回实际登记并等待相关引用按框架约定退出。清理尚未完成时通过 `pi_result` 返回 `Busy`，保留后续需要的状态。
+
+### 可选过程宏（Procedural macro）
+
+包装库可追加 `pi_ffi_macros = { path = "../pi-ffi/crates/pi_ffi_macros" }`。下面的调用使用上例的 `DECLARATION`、`PluginInputs`、`initialize` 和 `close`，替换 `static EXPORTS`、三个手工函数及函数指针声明。
+
+```rust
+pi_ffi_macros::export_plugin! {
+    declaration: DECLARATION,
+    state: PluginInputs,
+    initialize: initialize,
+    close: close,
+    runtime: none,
+}
+```
+
+有类型明确的可选运行时时用 `runtime: optional(MyRuntime)`，初始化函数接收 `Inputs<P2pServiceTerminal, MyRuntime>`。如果 Cargo 把 `pi_ffi` 改名为 `my_ffi`，加入 `api: ::my_ffi`。每份插件动态库使用一套手工入口或一次宏调用。
+
+### 宿主调用（Host calls）
+
+宿主使用实际构建记录调用 `PluginPackage::from_verified_build`。这个 `unsafe` 入口要求宿主已核实受信部署、配套构建与分配器，且文件和加载条件在约定的使用期间稳定。部署方有其真实构建记录后才使用下列装入和准备方法。宿主已有自己的终端及配置。创建 `TerminalInput` 时，宿主须确认双方配套构建使用同一原生终端类型、实际实例及其代码，并保活到最后使用和释放。只有此时才可调用 `unsafe { TerminalInput::new(terminal_arc) }`。后续准备方法接受这份已核实的终端输入。
+
+```rust
+use std::sync::Arc;
+
+use pi_ffi::{
+    config::Config,
+    host::{HostBuild, Initialization, Manager, Plugin, PluginPackage, PluginRequest, TerminalInput},
+    runtime::{IdleDispatch, RuntimeQuery, RuntimeWait},
+};
+use pi_p2p_service::P2pServiceTerminal;
+use pi_result::Result;
+
+pub fn prepare_example(
+    build: HostBuild,
+    package: &PluginPackage,
+    request: &PluginRequest,
+    terminal: TerminalInput<P2pServiceTerminal>,
+    config: Config,
+) -> Result<(Manager, Plugin, Initialization)> {
+    let manager = Manager::process(build)?;
+    let plugin = manager.load(package, request)?;
+    let round = plugin.prepare_without_runtime(terminal, config)?;
+    Ok((manager, plugin, round))
+}
+
+pub fn prepare_with_runtime<R>(
+    plugin: &Plugin,
+    terminal: TerminalInput<P2pServiceTerminal>,
+    config: Config,
+    runtime: Option<Arc<R>>,
+) -> Result<Initialization>
+where
+    R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+{
+    plugin.prepare(terminal, config, runtime)
+}
+```
+
+宿主从 `plugin.metadata()` 读取自己的元信息副本。保存 `round` 后调用 `round.initialize()`。成功或失败都保留原轮的句柄（handle），关闭时调用 `round.close()`。进度尚未完成时保留本轮并根据实际 `pi_result` 推进；例如在合适时机调用 `manager.maintain(budget)` 推进已登记归还，再使用原轮次继续关闭。确认关闭成功后才显式调用 `plugin.unload()`。系统释放结果不明时，按错误报告保留占用和退出证据，只读宿主已有副本。
+
+省略运行时的插件用 `prepare_without_runtime`。另一份用 `initialize` 接受可选运行时的插件，可与 `prepare_with_runtime` 配套使用；每个已准备轮次固定原入参。
 
 ## 恐慌（panic）策略与构建设置
 
@@ -260,5 +407,3 @@ fn main() -> pi_result::Result<()> {
 插件实现方负责让自身任务（task）、服务调用（service invocation）及相关资源真正退出；不得在推进这些工作的唯一执行线程（executor thread）上阻塞等待其完成。本库调用标准关闭并依据结果及受控代码持有推进最终卸载（unloading），不枚举或关闭业务服务（business service）。静态登记（static registration）可以被发现，不代表最终卸载（unloading）已经安全。
 
 后续可将 `pi_db_server` 等既有库包装为合规外部产物，并作为真实集成示例（integration example）。包装方应尽量保持原有接口（API），同时完整保持全部服务接口（service API）、语义（semantics）和逻辑（logic）；当前尚未验证其完整初始化与退出路径。
-
-随着正式接口（API）冻结和实现，将继续补齐宿主（host）管理接入、外部产物管理导出、初始化输入传递、失败清理及反复使用的可运行示例。静态／动态服务（static/dynamic service）示例仅演示下游插件使用既有框架的兼容性；本库不实现业务服务（business service）管理。这里的说明和示例不替代尚未完成的设计冻结或产品验收。

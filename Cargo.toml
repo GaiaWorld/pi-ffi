@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/pi_ffi_abi", "crates/pi_ffi_core", "crates/pi_ffi_adapters", "crates/pi_ffi"]
+members = [
+    "crates/pi_ffi_abi",
+    "crates/pi_ffi_core",
+    "crates/pi_ffi_adapters",
+    "crates/pi_ffi",
+    "crates/pi_ffi_macros",
+]
 
 [workspace.package]
 version = "0.1.0"
