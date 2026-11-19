@@ -338,8 +338,44 @@ fn io_error(failure: std::io::Error, path: &Path) -> Error {
         .attach(PathAttachment(path.to_owned()))
 }
 
+fn native_error(operation: &'static str, failure: libloading::Error) -> Error {
+    let detail = std::error::Error::source(&failure).map(ToString::to_string);
+    let report = loader_error(ErrorKind::Io, operation).attach(failure);
+    match detail {
+        Some(detail) => report.attach(detail),
+        None => report,
+    }
+}
+
 pub(super) fn open(files: &VerifiedFiles) -> Result<NativeModule> {
-    todo!("有已登记恢复位置才用平台单次参数装入。只取得一个真实系统引用；经 into_raw/from_raw 保存同一非拥有句柄与唯一系统拥有者，成功路径没有中间的可失败解析。")
+    let path = files.main.path.as_path();
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    // SAFETY: 调用方已登记恢复位置，文件来自可信部署（trusted deployment），
+    // 装入及释放时运行的本地初始化／终止代码都遵守其配套构建合同。
+    let loaded = unsafe { SystemLibrary::open(Some(path), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+    #[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+    let loaded = {
+        use libloading::os::windows::{
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        };
+        // SAFETY: 上层预留了恢复位置，可信部署保证 DLL 的入口及终止代码满足本轮合同。
+        unsafe {
+            SystemLibrary::load_with_flags(
+                path,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        }
+    };
+    let system = loaded.map_err(|failure| {
+        native_error("load native module", failure).attach(PathAttachment(path.to_owned()))
+    })?;
+    let handle = system.into_raw();
+    // SAFETY: 无中间可失败操作，将刚移出的同一系统引用（system reference）交回唯一拥有者。
+    let system = unsafe { SystemLibrary::from_raw(handle) };
+    Ok(NativeModule {
+        system: ManuallyDrop::new(system),
+        handle,
+    })
 }
 
 pub(super) fn verify_image(
@@ -354,11 +390,41 @@ pub(super) fn check_inputs(image: &VerifiedImage, has_runtime: bool) -> Result<(
 }
 
 pub(super) unsafe fn copy_metadata(image: &VerifiedImage, raw: MetadataV1) -> Result<Metadata> {
-    todo!("只在实际模块调用保护内核地址、可读区间和长度，读取 UTF-8，解析完整 SemVer。宿主持有最终字符串及完整值。")
+    if raw.uuid.bytes == [0; 16] {
+        return Err(loader_error(ErrorKind::Corrupted, "metadata UUID"));
+    }
+    let length = usize::try_from(raw.version_len)
+        .ok()
+        .filter(|length| (1..=isize::MAX as usize).contains(length))
+        .ok_or_else(|| {
+            loader_error(ErrorKind::Corrupted, "metadata version length").attach(raw.version_len)
+        })?;
+    let end = raw.version.addr().checked_add(length);
+    if !end.is_some_and(|end| {
+        !raw.version.is_null() && mapped_metadata_range(image.identity, raw.version, end)
+    }) {
+        return Err(loader_error(ErrorKind::Corrupted, "metadata version range"));
+    }
+    // SAFETY: 调用方保持本模块的实际系统引用（system reference）。生产方的版本来自同一
+    // 不可变字节对象。已核实整段地址、归属及可读范围，借用仅持续到解析结束。
+    let bytes = unsafe { std::slice::from_raw_parts(raw.version, length) };
+    let version = std::str::from_utf8(bytes).map_err(|failure| {
+        loader_error(ErrorKind::Corrupted, "metadata version UTF-8").attach(failure)
+    })?;
+    let version = semver::Version::parse(version).map_err(|failure| {
+        loader_error(ErrorKind::Corrupted, "metadata version SemVer").attach(failure)
+    })?;
+    Ok(Metadata {
+        uuid: raw.uuid.bytes,
+        version,
+    })
 }
 
 pub(super) fn close(module: NativeModule) -> Result<()> {
-    todo!("已禁止取得新调用资格且原持有均退出后，消费一次真实系统引用。报告系统结果，不推导物理卸载；不在析构中重试。")
+    // 显式归还系统引用（system reference）。libloading 的 close 消费引用并保留系统错误。
+    ManuallyDrop::into_inner(module.system)
+        .close()
+        .map_err(|failure| native_error("release native module reference", failure))
 }
 
 pub(super) fn verified_file_identity(files: &VerifiedFiles) -> FileIdentity {
@@ -366,11 +432,188 @@ pub(super) fn verified_file_identity(files: &VerifiedFiles) -> FileIdentity {
 }
 
 pub(super) fn mapped_identity(module: &NativeModule) -> Result<MappedIdentity> {
-    todo!(
-        "从本次系统引用借用真实句柄。Linux 以 dlinfo 从该句柄取得活 link_map，Windows 用同一 HMODULE；期间不调用或使用标准导出作身份依据。"
-    )
+    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+    let address = linux_link_map(module)?.addr();
+    #[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+    let address = module.handle as usize;
+    Ok(MappedIdentity { address })
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn linux_link_map(module: &NativeModule) -> Result<*mut ElfLinkMapPrefix> {
+    let mut mapping = std::ptr::null_mut::<ElfLinkMapPrefix>();
+    // SAFETY: NativeModule 仍拥有本次装入引用，link_map 输出槽宽度准确且独占可写。
+    let status = unsafe {
+        libc::dlinfo(
+            module.handle,
+            libc::RTLD_DI_LINKMAP,
+            std::ptr::from_mut(&mut mapping).cast(),
+        )
+    };
+    if status != 0 {
+        let error = loader_error(ErrorKind::Io, "read native link map");
+        // SAFETY: 同一线程立即读取 glibc 的本次失败文本，并在下一次平台调用之前复制。
+        let message = unsafe {
+            let message = libc::dlerror();
+            (!message.is_null()).then(|| {
+                std::ffi::CStr::from_ptr(message)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        };
+        return Err(match message {
+            Some(message) => error.attach(message),
+            None => error,
+        });
+    }
+    if mapping.is_null() {
+        return Err(loader_error(
+            ErrorKind::Corrupted,
+            "native link map identity",
+        ));
+    }
+    Ok(mapping)
 }
 
 pub(super) fn verified_manifest(files: &VerifiedFiles) -> &BuildManifest {
     files.package.manifest()
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+#[repr(C)]
+struct ElfLinkMapPrefix {
+    load_bias: libc::Elf64_Addr,
+    file_name: *const libc::c_char,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+struct ElfMetadataRange {
+    load_bias: libc::Elf64_Addr,
+    file_name: *const libc::c_char,
+    start: usize,
+    end: usize,
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+fn mapped_metadata_range(identity: MappedIdentity, version: *const u8, end: usize) -> bool {
+    // glibc 的 dlfcn.h 为此值指定 link_map 输出槽（output slot）。
+    const RTLD_DL_LINKMAP: libc::c_int = 2;
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    let mut map = std::ptr::null_mut();
+    // SAFETY: dladdr1 按数值查询地址，两个输出槽独占可写且大小准确。
+    let found =
+        unsafe { libc::dladdr1(version.cast(), info.as_mut_ptr(), &mut map, RTLD_DL_LINKMAP) };
+    if found == 0 || map.is_null() || map.addr() != identity.address {
+        return false;
+    }
+    // SAFETY: 查询返回了调用方仍持有的同一 link_map。只读取 GNU 公开布局的前两项。
+    let map = unsafe { &*map.cast::<ElfLinkMapPrefix>() };
+    let mut range = ElfMetadataRange {
+        load_bias: map.load_bias,
+        file_name: map.file_name,
+        start: version.addr(),
+        end,
+    };
+    // SAFETY: 同步枚举实际映像（mapped image）。区间参数和对应系统引用在回调期间有效。
+    unsafe {
+        libc::dl_iterate_phdr(
+            Some(readable_elf_metadata_range),
+            std::ptr::from_mut(&mut range).cast(),
+        ) == 1
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
+unsafe extern "C" fn readable_elf_metadata_range(
+    info: *mut libc::dl_phdr_info,
+    size: usize,
+    data: *mut core::ffi::c_void,
+) -> libc::c_int {
+    if size < size_of::<libc::dl_phdr_info>() {
+        return 0;
+    }
+    // SAFETY: 同步枚举（enumeration）提供本次映像描述及原样传回调用方的区间参数。
+    let (info, range) = unsafe { (&*info, &*data.cast::<ElfMetadataRange>()) };
+    if info.dlpi_addr != range.load_bias
+        || info.dlpi_name.is_null()
+        || range.file_name.is_null()
+        || info.dlpi_phdr.is_null()
+    {
+        return 0;
+    }
+    // SAFETY: 两个名称来自仍有效的系统记录，均以零字节结束。
+    let names_match = unsafe {
+        std::ffi::CStr::from_ptr(info.dlpi_name) == std::ffi::CStr::from_ptr(range.file_name)
+    };
+    if !names_match {
+        return 0;
+    }
+    // SAFETY: 枚举接口保证程序头（program header）表在回调内有效，条数取自同一记录。
+    let headers =
+        unsafe { std::slice::from_raw_parts(info.dlpi_phdr, usize::from(info.dlpi_phnum)) };
+    let mut cursor = range.start;
+    // ELF 按虚拟地址（virtual address）从低到高列出加载段。字节范围只能由可读加载段连续覆盖。
+    for header in headers {
+        if header.p_type != libc::PT_LOAD || header.p_flags & libc::PF_R == 0 {
+            continue;
+        }
+        // GNU 的装入偏移（load bias）是无符号地址差，可用回绕运算表示负偏移。
+        let start = (info.dlpi_addr as usize).wrapping_add(header.p_vaddr as usize);
+        let Some(end) = start.checked_add(header.p_memsz as usize) else {
+            continue;
+        };
+        if start <= cursor && cursor < end {
+            cursor = end;
+            if cursor >= range.end {
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+#[cfg(all(target_os = "windows", target_env = "msvc", target_arch = "x86_64"))]
+fn mapped_metadata_range(identity: MappedIdentity, version: *const u8, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, PAGE_EXECUTE_READ,
+        PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE,
+        PAGE_WRITECOPY,
+    };
+    let readable = PAGE_READONLY
+        | PAGE_READWRITE
+        | PAGE_WRITECOPY
+        | PAGE_EXECUTE_READ
+        | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    let mut cursor = version.addr();
+    let mut region = MEMORY_BASIC_INFORMATION::default();
+    while cursor < end {
+        // SAFETY: VirtualQuery 按数值查询地址。输出槽（output slot）独占可写且大小准确。
+        let written = unsafe {
+            VirtualQuery(
+                std::ptr::without_provenance(cursor),
+                &mut region,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let start = region.BaseAddress.addr();
+        if written != size_of::<MEMORY_BASIC_INFORMATION>()
+            || region.AllocationBase.addr() != identity.address
+            || region.State != MEM_COMMIT
+            || region.Type != MEM_IMAGE
+            || region.Protect & readable == 0
+            || region.Protect & PAGE_GUARD != 0
+            || start > cursor
+        {
+            return false;
+        }
+        let Some(next) = start
+            .checked_add(region.RegionSize)
+            .filter(|&next| next > cursor)
+        else {
+            return false;
+        };
+        cursor = next;
+    }
+    true
 }
