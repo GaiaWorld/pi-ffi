@@ -15,7 +15,7 @@ use pi_result::{Error, ErrorKind, Result};
 use std::{
     ffi::c_void,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -36,6 +36,7 @@ struct Scopes {
 #[derive(Default)]
 struct Endpoint {
     sequence: AtomicU64,
+    next_failure: AtomicU32,
     registry: Mutex<Fixture>,
 }
 
@@ -46,6 +47,8 @@ struct Fixture {
     source: Option<SourceDescriptorV1>,
     holds: Vec<(CallTargetV1, bool)>,
     calls: Vec<u64>,
+    retire_requests: Vec<(u64, u64)>,
+    retire_controls: usize,
 }
 
 // SAFETY: 地址仅来自本进程的实际 Registry 和不可变操作表（operation table），
@@ -143,6 +146,10 @@ impl Endpoint {
 unsafe extern "C" fn next_operation(context: *mut c_void, out: *mut OperationIdV1) -> u32 {
     // SAFETY: Connection::from_native 的受控视图（controlled view）提供这两个准确地址。
     let scope = unsafe { &*context.cast::<Scope>() };
+    let failure = scope.endpoint.next_failure.swap(0, Ordering::Relaxed);
+    if failure != 0 {
+        return failure;
+    }
     unsafe { out.write(scope.endpoint.next(scope.actor)) };
     0
 }
@@ -231,10 +238,14 @@ unsafe extern "C" fn retire_source(
     // SAFETY: 该管理入口（control entry）由有效的 Scope（actor scope）提供。
     let scope = unsafe { &*context.cast::<Scope>() };
     let source = {
-        let state = scope.endpoint.registry.lock();
+        let mut state = scope.endpoint.registry.lock();
+        state
+            .retire_requests
+            .push((operation.actor, operation.sequence));
         if !state.calls.is_empty() {
             return diagnostic::limited_outcome(ErrorKind::Busy, ErrorKind::InvalidState);
         }
+        state.retire_controls += 1;
         state.source
     };
     let Some(source) = source else {
@@ -744,4 +755,339 @@ unsafe extern "C" fn wire_release_diagnostic(context: *mut c_void, lease: LeaseV
         }
     }
     diagnostic::status_code(ErrorKind::NotFound)
+}
+
+/// 来源仍有活动调用（active call）时，重复退役请求应使用同一编号，宿主暂不调用来源控制表。
+#[test]
+fn test_retry_keeps_retirement_identity_when_source_is_busy() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    let object = registry.export((), Vec::new(), |_| Ok(()))?;
+    object.with_borrowed(|_| {
+        for _ in 0..2 {
+            let error = registry.try_retire().unwrap_err();
+            assert_eq!(error.current_context(), &ErrorKind::Busy);
+        }
+        let state = endpoint.registry.lock();
+        assert_eq!(state.retire_controls, 0);
+        assert_eq!(state.retire_requests.len(), 2);
+        assert_eq!(state.retire_requests[0], state.retire_requests[1]);
+        Ok(())
+    })?;
+    let failure = registry
+        .export((), Vec::new(), |_| Ok(()))
+        .err()
+        .expect("new business is disabled after submitting retirement");
+    assert_eq!(failure.current_context(), &ErrorKind::InvalidState);
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(registry.maintain()?, 0);
+    registry.try_retire()?;
+    let state = endpoint.registry.lock();
+    assert_eq!(state.retire_controls, 1);
+    assert_eq!(state.retire_requests.len(), 3);
+    assert_eq!(state.retire_requests[0], state.retire_requests[2]);
+    assert!(state.source.is_none());
+    drop(state);
+    registry.try_retire()?;
+    assert_eq!(endpoint.registry.lock().retire_requests.len(), 3);
+    Ok(())
+}
+
+/// 取号暂失败时不提交退役或关闭新业务，之后可重新取得合法请求号。
+#[test]
+fn test_retirement_request_can_retry_failed_assignment() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    endpoint
+        .next_failure
+        .store(diagnostic::status_code(ErrorKind::Io), Ordering::Relaxed);
+    assert_eq!(
+        registry.try_retire().unwrap_err().current_context(),
+        &ErrorKind::Io
+    );
+    assert!(endpoint.registry.lock().retire_requests.is_empty());
+    let object = registry.export((), Vec::new(), |_| Ok(()))?;
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(registry.maintain()?, 0);
+    registry.try_retire()?;
+    let state = endpoint.registry.lock();
+    assert_eq!(state.retire_requests.len(), 1);
+    assert_eq!(state.retire_controls, 1);
+    assert!(state.source.is_none());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct CleanupPanics;
+
+impl core::fmt::Display for CleanupPanics {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("test attachment")
+    }
+}
+
+impl Drop for CleanupPanics {
+    fn drop(&mut self) {
+        panic!("controlled Rust test failure during cleanup");
+    }
+}
+
+/// 原报告处理失败保留原分类，并且没有新的诊断登记。已有读权限和实际归还依然有效。
+#[test]
+fn test_error_report_cleanup_precedes_diagnostic_registration() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    let declaration = unsafe { ExportedInterface::new::<Example>(&HEADER) }?;
+    let object = registry.export(17u32, vec![declaration], |_| Ok(()))?;
+    let interface = object.interface::<Example>()?;
+    let failure = interface
+        .with_call(1, |call| {
+            // SAFETY: 本次访问由同一实际来源及已核对的对象持有（holding）保护。
+            let outcome = unsafe {
+                Registry::dispatch::<u32>(call.context, call.lease(), request(), 1, |_| {
+                    Err(Error::new(ErrorKind::Io).attach(CleanupPanics))
+                })
+            };
+            assert_eq!(outcome.kind, diagnostic::status_code(ErrorKind::Io));
+            assert_eq!(
+                outcome.diagnostic_failure_kind,
+                diagnostic::status_code(ErrorKind::Internal)
+            );
+            assert!(outcome.diagnostic.context.is_null());
+            // SAFETY: 仅接管当前受保护调用的完整结果一次。
+            unsafe { call.decode(outcome) }
+        })
+        .unwrap_err();
+    let registered = endpoint
+        .registry
+        .lock()
+        .holds
+        .iter()
+        .filter(|(target, _)| target.kind == TARGET_DIAGNOSTIC)
+        .count();
+    assert_eq!(
+        registered, 0,
+        "cleanup failed before diagnostic publication"
+    );
+    assert_eq!(failure.current_context(), &ErrorKind::Io);
+    let value = interface.with_call(1, |call| {
+        registry.with_access(call.lease(), request(), 1, |value: &u32| Ok(*value))
+    })?;
+    assert_eq!(value, 17);
+    drop(interface);
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(
+        registry.maintain().unwrap_err().current_context(),
+        &ErrorKind::Internal
+    );
+    assert_eq!(
+        registry.try_retire().unwrap_err().current_context(),
+        &ErrorKind::Internal
+    );
+    assert!(endpoint.registry.lock().source.is_some());
+    assert_eq!(endpoint.drain_requested(), 1);
+    Ok(())
+}
+
+/// 处理恐慌负载（panic payload）也失败时，保留本地来源的失败状态。
+#[test]
+fn test_panic_payload_cleanup_failure_remains_observable() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    let declaration = unsafe { ExportedInterface::new::<Example>(&HEADER) }?;
+    let object = registry.export(17u32, vec![declaration], |_| Ok(()))?;
+    let interface = object.interface::<Example>()?;
+    let failure = interface
+        .with_call(1, |call| {
+            // SAFETY: 同一真实来源和本次借用覆盖闭包、返回和归还。
+            let outcome = unsafe {
+                Registry::dispatch::<u32>(call.context, call.lease(), request(), 1, |_| {
+                    std::panic::panic_any(CleanupPanics)
+                })
+            };
+            unsafe { call.decode(outcome) }
+        })
+        .unwrap_err();
+    assert_eq!(failure.current_context(), &ErrorKind::Internal);
+    drop(interface);
+    object.release()?;
+    endpoint.drain_requested();
+    assert!(
+        registry.maintain().is_err(),
+        "uncertain cleanup was forgotten by the source"
+    );
+    Ok(())
+}
+
+struct FormattingPanics;
+
+impl core::fmt::Display for FormattingPanics {
+    fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        std::panic::panic_any(CleanupPanics)
+    }
+}
+
+impl core::fmt::Debug for FormattingPanics {
+    fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        std::panic::panic_any(CleanupPanics)
+    }
+}
+
+/// 格式化错误报告时捕获的值也必须完成清理。未确认时持久保留，并允许原持有继续归还。
+#[test]
+fn test_snapshot_payload_cleanup_failure_remains_observable() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    // SAFETY: Example 使用由同一来源保活的实际固定表（static table）。
+    let declaration = unsafe { ExportedInterface::new::<Example>(&HEADER) }?;
+    let object = registry.export(17u32, vec![declaration], |_| Ok(()))?;
+    let interface = object.interface::<Example>()?;
+    let failure = interface
+        .with_call(1, |call| {
+            // SAFETY: 原对象的真实持有（holding）和调用（call）覆盖报告格式化。
+            let outcome = unsafe {
+                Registry::dispatch::<u32>(call.context, call.lease(), request(), 1, |_| {
+                    Err(Error::new(ErrorKind::Io).attach(FormattingPanics))
+                })
+            };
+            assert_eq!(outcome.kind, diagnostic::status_code(ErrorKind::Io));
+            assert_eq!(
+                outcome.diagnostic_failure_kind,
+                diagnostic::status_code(ErrorKind::Internal)
+            );
+            assert!(outcome.diagnostic.context.is_null());
+            // SAFETY: 当前实际活动调用独占接管返回结果。
+            unsafe { call.decode(outcome) }
+        })
+        .unwrap_err();
+    assert_eq!(failure.current_context(), &ErrorKind::Io);
+    drop(interface);
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(
+        registry.maintain().unwrap_err().current_context(),
+        &ErrorKind::Internal
+    );
+    assert_eq!(
+        registry.try_retire().unwrap_err().current_context(),
+        &ErrorKind::Internal
+    );
+    assert!(endpoint.registry.lock().source.is_some());
+    assert_eq!(endpoint.drain_requested(), 1);
+    Ok(())
+}
+
+struct CountedBusyReport {
+    formatted: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl core::fmt::Debug for CountedBusyReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(self, f)
+    }
+}
+
+impl core::fmt::Display for CountedBusyReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.formatted.fetch_add(1, Ordering::Relaxed);
+        f.write_str("observed Busy report")
+    }
+}
+
+impl Drop for CountedBusyReport {
+    fn drop(&mut self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 本地 Busy 报告无需格式化。处理完成后继续推进同一真实对象的关闭。
+#[test]
+fn test_clean_busy_report_allows_close_retry() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let registry = Registry::attach(endpoint.connection()?)?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let report_drops = Arc::new(AtomicUsize::new(0));
+    let report_formats = Arc::new(AtomicUsize::new(0));
+    let (observed_calls, observed_drops) = (calls.clone(), report_drops.clone());
+    let observed_formats = report_formats.clone();
+    let object = registry.export(17u32, Vec::new(), move |value| {
+        assert_eq!(*value, 17);
+        if observed_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            let attachment = CountedBusyReport {
+                dropped: observed_drops.clone(),
+                formatted: observed_formats.clone(),
+            };
+            return Err(Error::new(ErrorKind::Busy).attach(attachment));
+        }
+        assert_eq!(observed_drops.load(Ordering::Relaxed), 1);
+        Ok(())
+    })?;
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(registry.maintain()?, 1);
+    assert_eq!(report_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(report_formats.load(Ordering::Relaxed), 0);
+    assert_eq!(registry.maintain()?, 0);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    registry.try_retire()?;
+    assert!(endpoint.registry.lock().source.is_none());
+    Ok(())
+}
+
+/// 处理 Busy 报告失误后停止重复执行关闭。来源控制接口完整交付实际清理错误及原回调类别。
+#[test]
+fn test_unclean_busy_report_reports_terminal_cleanup_failure() -> Result<()> {
+    let endpoint = Arc::new(Endpoint::default());
+    let connection = endpoint.connection()?;
+    let registry = Registry::attach(connection.clone())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = calls.clone();
+    let object = registry.export(17u32, Vec::new(), move |_| {
+        observed_calls.fetch_add(1, Ordering::Relaxed);
+        Err(Error::new(ErrorKind::Busy).attach(CleanupPanics))
+    })?;
+    object.release()?;
+    assert_eq!(endpoint.drain_requested(), 1);
+    let source = endpoint
+        .registry
+        .lock()
+        .source
+        .expect("source still registered");
+    let operation = endpoint.next(0);
+    let mut out = pi_ffi_abi::MaintenanceV1 { remaining: 777 };
+    // SAFETY: 端点实际登记的存活来源拥有这张控制表（control table），维护结果槽独占可写。
+    let outcome = unsafe {
+        ((*source.control).maintain.unwrap())(source.context, SOURCE_ID, operation, &mut out)
+    };
+    assert_eq!(out.remaining, 777);
+    assert_eq!(outcome.kind, diagnostic::status_code(ErrorKind::Internal));
+    // SAFETY: 仍在实际来源登记内。唯一读出并归还上述控制调用交付的诊断。
+    let failure = unsafe { diagnostic::decode_management(Some(&connection), outcome) }.unwrap_err();
+    let copied = diagnostic::copied_diagnostic(&failure).expect("a complete cleanup diagnostic");
+    assert!(
+        copied.debug.to_lowercase().contains("busy"),
+        "{}",
+        copied.debug
+    );
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(
+        registry.maintain().unwrap_err().current_context(),
+        &ErrorKind::Internal
+    );
+    let retired = registry.try_retire().unwrap_err();
+    assert_eq!(retired.current_context(), &ErrorKind::Internal);
+    let copied = diagnostic::copied_diagnostic(&retired).expect("a complete retirement diagnostic");
+    assert!(
+        copied.debug.to_lowercase().contains("busy"),
+        "{}",
+        copied.debug
+    );
+    assert_eq!(endpoint.drain_requested(), 1);
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(endpoint.registry.lock().source.is_some());
+    Ok(())
 }

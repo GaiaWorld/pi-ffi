@@ -228,10 +228,18 @@ pub(super) fn registry_maintain(receiver: &Registry) -> Result<u64> {
     if let Err(failure) = close_result {
         let kind = *failure.current_context();
         if kind == ErrorKind::Busy {
-            restore_cleanup(&mut attempt, EntryPhase::Revoking, None);
+            match discard_busy_report(&receiver.shared, failure) {
+                Some(cleanup) => restore_cleanup(&mut attempt, EntryPhase::Failed, Some(cleanup)),
+                None => restore_cleanup(&mut attempt, EntryPhase::Revoking, None),
+            }
             return remaining_or_failure(&receiver.shared);
         }
-        let failure = Arc::new(failure);
+        let (cached, unconfirmed) = finish_source_failure(&receiver.shared, failure);
+        if let Some(cleanup) = unconfirmed {
+            restore_cleanup(&mut attempt, EntryPhase::Failed, Some(cleanup));
+            return remaining_or_failure(&receiver.shared);
+        }
+        let failure = Arc::new(source_error_from_snapshot(&cached));
         restore_cleanup(
             &mut attempt,
             EntryPhase::Failed,
@@ -305,26 +313,50 @@ pub(super) fn registry_maintain(receiver: &Registry) -> Result<u64> {
 }
 
 pub(super) fn registry_try_retire(receiver: &Registry) -> Result<()> {
-    let (source, pending) = {
-        let state = receiver.shared.state.lock();
+    let request = {
+        let mut state = receiver.shared.state.lock();
         if matches!(state.phase, SourcePhase::Retired) {
             return Ok(());
         }
-        let pending = state.operations.iter().rev().find_map(|(id, stored)| {
-            if matches!(stored.input, OperationInput::Retire)
-                && matches!(stored.phase, OperationPhase::Pending)
-            {
-                Some(copy_operation(id))
-            } else {
-                None
+        match &state.retirement_request {
+            RetirementRequest::Assigned(operation) => {
+                Ok((state.source, Some(copy_operation(operation))))
             }
-        });
-        (state.source, pending)
+            RetirementRequest::Assigning => Err(ErrorKind::Busy),
+            RetirementRequest::Unassigned => {
+                state.retirement_request = RetirementRequest::Assigning;
+                Ok((state.source, None))
+            }
+        }
     };
+    let (source, pending) = request.map_err(|kind| error(kind, "assign source retirement"))?;
     let connection = &receiver.shared.connection;
     let operation = match pending {
         Some(operation) => operation,
-        None => connection.next_operation()?,
+        None => {
+            let next = connection.next_operation();
+            let mut state = receiver.shared.state.lock();
+            match next {
+                Ok(operation) => {
+                    if matches!(state.phase, SourcePhase::Retired) {
+                        return Ok(());
+                    }
+                    state.retirement_request =
+                        RetirementRequest::Assigned(copy_operation(&operation));
+                    if matches!(state.phase, SourcePhase::Open) {
+                        state.phase = SourcePhase::Closing;
+                    }
+                    operation
+                }
+                Err(failure) => {
+                    state.retirement_request = RetirementRequest::Unassigned;
+                    if matches!(state.phase, SourcePhase::Retired) {
+                        return Ok(());
+                    }
+                    return Err(failure);
+                }
+            }
+        }
     };
     diagnostic::decode(connection, connection.retire_raw(source, operation))
 }
@@ -744,6 +776,9 @@ pub(super) unsafe fn try_retire(
             shared,
             Err(error(ErrorKind::Corrupted, "retirement replay")),
         ),
+        Err(ErrorKind::Busy) => {
+            diagnostic::limited_outcome(ErrorKind::Busy, ErrorKind::InvalidState)
+        }
         Err(kind) => source_outcome(shared, Err(error(kind, "retire source"))),
     }
 }
@@ -832,6 +867,9 @@ pub(super) fn publish_management_failure(
     registry: &Registry,
     failure: &crate::diagnostic::ManagementFailure,
 ) -> OutcomeV1 {
+    if failure.cleanup_unconfirmed {
+        retain_unconfirmed_cleanup(&registry.shared, snapshot_kind(&failure.cached), None);
+    }
     publish_failure(&registry.shared, &failure.cached)
 }
 
@@ -839,9 +877,104 @@ fn source_outcome(shared: &Shared, result: Result<()>) -> OutcomeV1 {
     match result {
         Ok(()) => diagnostic::success_outcome(),
         Err(failure) => {
-            let failure = diagnostic::ManagementFailure::capture(&failure);
-            publish_failure(shared, &failure.cached)
+            let (cached, _) = finish_source_failure(shared, failure);
+            publish_failure(shared, &cached)
         }
+    }
+}
+
+fn finish_source_failure(shared: &Shared, original: Error) -> (CachedFailure, Option<Failure>) {
+    let kind = *original.current_context();
+    let failure = diagnostic::ManagementFailure::capture(&original);
+    if let Err(report) = drop_source_report(shared, original) {
+        let cleanup = retain_unconfirmed_cleanup(shared, kind, Some(report));
+        return (
+            CachedFailure::Unavailable {
+                operation: kind,
+                diagnostic: cleanup.kind,
+            },
+            Some(cleanup),
+        );
+    }
+    let cleanup = failure
+        .cleanup_unconfirmed
+        .then(|| retain_unconfirmed_cleanup(shared, kind, None));
+    (failure.cached, cleanup)
+}
+
+fn discard_busy_report(shared: &Shared, original: Error) -> Option<Failure> {
+    let marked = original
+        .downcast_ref::<boundary::UnconfirmedPanicCleanup>()
+        .is_some();
+    let report = drop_source_report(shared, original).err();
+    (marked || report.is_some())
+        .then(|| retain_unconfirmed_cleanup(shared, ErrorKind::Busy, report))
+}
+
+fn drop_source_report(shared: &Shared, original: Error) -> Result<()> {
+    let initialization = shared.connection.initialization();
+    let source = shared.state.lock().source;
+    boundary::catch(
+        boundary::Context {
+            operation: "drop source report",
+            module_epoch: initialization.module_epoch,
+            round: initialization.round,
+            source,
+        },
+        || {
+            drop(original);
+            Ok(())
+        },
+    )
+}
+
+fn retain_unconfirmed_cleanup(
+    shared: &Shared,
+    original: ErrorKind,
+    report: Option<Error>,
+) -> Failure {
+    let kind = report
+        .as_ref()
+        .map_or(ErrorKind::Internal, |report| *report.current_context());
+    let failure = Failure {
+        kind,
+        secondary: Some(original),
+        report: report.map(Arc::new),
+    };
+    {
+        let mut state = shared.state.lock();
+        if !matches!(state.phase, SourcePhase::Retired) {
+            state.phase = SourcePhase::Failed;
+            if state.failure.is_none() {
+                state.failure = Some(copy_recorded_failure(&failure));
+            }
+        }
+    }
+    failure
+}
+
+fn snapshot_kind(failure: &CachedFailure) -> ErrorKind {
+    match failure {
+        CachedFailure::Complete(snapshot) => snapshot.kind,
+        CachedFailure::Unavailable { operation, .. } => *operation,
+    }
+}
+
+fn source_error_from_snapshot(failure: &CachedFailure) -> Error {
+    match failure {
+        CachedFailure::Complete(snapshot) => diagnostic::CopiedDiagnostic {
+            kind: snapshot.kind,
+            user: snapshot.user.clone(),
+            verbose: snapshot.verbose.clone(),
+            debug: snapshot.debug.clone(),
+            raw_kind: boundary::encode_kind(snapshot.kind),
+        }
+        .into_error(),
+        CachedFailure::Unavailable {
+            operation,
+            diagnostic,
+        } => error(*operation, "source close failure")
+            .attach(error(*diagnostic, "source close diagnostic snapshot")),
     }
 }
 
@@ -1299,18 +1432,21 @@ fn complete_operation(mut mutation: Mutation, phase: OperationPhase) {
 
 fn reject_operation(mutation: Mutation, error: Error, pending_on_busy: bool) -> OutcomeV1 {
     let shared = Arc::clone(&mutation.shared);
-    let kind = *error.current_context();
-    if kind == ErrorKind::Busy && pending_on_busy {
-        complete_operation(mutation, OperationPhase::Pending);
-        // 保留同逻辑退役请求。Busy 不产生新的来源诊断持有（diagnostic holding）来阻碍其下一次检查。
-        return diagnostic::limited_outcome(ErrorKind::Busy, ErrorKind::InvalidState);
-    }
-    let failure = diagnostic::ManagementFailure::capture(&error);
-    complete_operation(
-        mutation,
-        OperationPhase::Failed(copy_failure(&failure.cached)),
-    );
-    publish_failure(&shared, &failure.cached)
+    let report = if pending_on_busy && *error.current_context() == ErrorKind::Busy {
+        match discard_busy_report(&shared, error) {
+            Some(cleanup) => cleanup_error(cleanup),
+            None => {
+                complete_operation(mutation, OperationPhase::Pending);
+                // 保留同次退役请求和下一次检查资格，Busy 无须创建来源诊断持有（diagnostic holding）。
+                return diagnostic::limited_outcome(ErrorKind::Busy, ErrorKind::InvalidState);
+            }
+        }
+    } else {
+        error
+    };
+    let (cached, _) = finish_source_failure(&shared, report);
+    complete_operation(mutation, OperationPhase::Failed(copy_failure(&cached)));
+    publish_failure(&shared, &cached)
 }
 
 fn operation_index(state: &State, operation: &OperationIdV1) -> core::result::Result<usize, usize> {
@@ -1364,45 +1500,37 @@ fn copy_failure(failure: &CachedFailure) -> CachedFailure {
 }
 
 fn retirement_check(shared: &Shared) -> Result<()> {
-    remaining_or_failure(shared)?;
-    let ready = {
+    let failure = {
         let mut state = shared.state.lock();
         if matches!(state.phase, SourcePhase::Open) {
             state.phase = SourcePhase::Closing;
         }
-        let ready = matches!(state.phase, SourcePhase::Closing | SourcePhase::Retiring)
-            && state.failure.is_none()
-            && state
-                .entries
-                .iter()
-                .all(|entry| matches!(entry.phase, EntryPhase::Retired));
-        if ready {
-            state.phase = SourcePhase::Retiring;
+        if let Some(failure) = recorded_failure(&state) {
+            Some(failure)
+        } else {
+            let ready = matches!(state.phase, SourcePhase::Closing | SourcePhase::Retiring)
+                && state
+                    .entries
+                    .iter()
+                    .all(|entry| matches!(entry.phase, EntryPhase::Retired));
+            if ready {
+                state.phase = SourcePhase::Retiring;
+                return Ok(());
+            }
+            None
         }
-        ready
     };
-    if ready {
-        Ok(())
-    } else {
-        Err(error(ErrorKind::Busy, "source retirement check"))
-    }
+    Err(failure.map_or_else(
+        || error(ErrorKind::Busy, "source retirement check"),
+        cleanup_error,
+    ))
 }
 
 fn remaining_or_failure(shared: &Shared) -> Result<u64> {
     let result = {
         let state = shared.state.lock();
-        let first_failure = state.failure.as_ref().or_else(|| {
-            state
-                .entries
-                .iter()
-                .find_map(|entry| entry.failure.as_ref())
-        });
-        match first_failure {
-            Some(failure) => Err((
-                failure.kind,
-                failure.secondary,
-                failure.report.as_ref().map(Arc::clone),
-            )),
+        match recorded_failure(&state) {
+            Some(failure) => Err(failure),
             None => Ok(state
                 .entries
                 .iter()
@@ -1410,16 +1538,40 @@ fn remaining_or_failure(shared: &Shared) -> Result<u64> {
                 .count() as u64),
         }
     };
-    result.map_err(|(kind, secondary, report)| {
-        let mut failure = error(kind, "source cleanup");
-        if let Some(report) = report {
-            failure = failure.attach(report);
-        }
-        if let Some(kind) = secondary {
-            failure = failure.attach(kind);
-        }
-        failure
-    })
+    result.map_err(cleanup_error)
+}
+
+fn recorded_failure(state: &State) -> Option<Failure> {
+    state
+        .failure
+        .as_ref()
+        .or_else(|| {
+            state
+                .entries
+                .iter()
+                .find_map(|entry| entry.failure.as_ref())
+        })
+        .map(copy_recorded_failure)
+}
+
+fn copy_recorded_failure(failure: &Failure) -> Failure {
+    Failure {
+        kind: failure.kind,
+        secondary: failure.secondary,
+        report: failure.report.as_ref().map(Arc::clone),
+    }
+}
+
+fn cleanup_error(recorded: Failure) -> Error {
+    let mut failure = error(recorded.kind, "source cleanup");
+    if let Some(report) = recorded.report {
+        failure = failure.attach(report);
+    }
+    if let Some(kind) = recorded.secondary {
+        // 将原分类作为独立报告附加，避免 pi_result 将同类型的附加数据当作主分类。
+        failure = failure.attach(error(kind, "related source failure"));
+    }
+    failure
 }
 
 fn restore_cleanup(attempt: &mut CleanupAttempt, phase: EntryPhase, failure: Option<Failure>) {
