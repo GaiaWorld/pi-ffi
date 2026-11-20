@@ -146,7 +146,9 @@ const _: CloseFnV1 = pi_ffi_close_v1;
 
 ### 使用声明、配置和关闭（Combining capabilities）
 
-插件通过 `service::register_static` 在标准初始化期间汇总本插件的适用声明并交配套框架登记。使用共享终端前须核实框架可一次登记、按本轮标识撤回并确认引用退出；由插件保存本轮记录并负责关闭。动态服务和业务 RPC 沿外部接口。原生终端句柄、引用和回调依对应的 `Terminal` 持有，先收尾这些使用才确认关闭。
+插件（plugin）可在自己的 Rust 代码中使用原生接口（native APIs），或选择 `service::register_static` 收集一次静态声明（static declarations）。空集合（empty collection）直接成功；收集时分配失败（allocation failure）在闭包（closure）前返回；非空集合（nonempty collection）只调用一次所提供的闭包（closure）并原样返回其实际结果（actual result）。本函数不保证整批操作的原子性（atomicity）、业务就绪（business readiness）或静态注销（static unregistration）。具体服务（services）能力以配套版本的原生接口（native APIs）为准。
+
+服务（services）的全部实现（implementation）、注册（registration）、管理（management）及注销（unregistration）由插件（plugin）内部负责，对宿主管理流程（host management flow）透明。静态服务（static services）在当前 P2P 主机网络（P2P host network）中不注销（unregistration），动态服务（dynamic services）允许运行期（runtime）注销（unregistration）。标准初始化（initialization）及关闭（close）的实际返回由插件（plugin）决定，本库严格按该返回和自身持有处理，不检查内部服务（services）清单或状态（states）。持有原生终端（terminal）派生的句柄（handles）、引用或回调（callbacks）时，仍保留对应 `Terminal` 至满足这些对象的存续条件。
 
 本轮 `Config` 可以按其原生接口直接使用。旧业务依赖其它配置版本时，按业务的原构造和优先级获得旧版真实值。运行时能力的变更在新的合法初始化轮次中选择；插件拥有本轮派生任务与引用的清理责任。
 

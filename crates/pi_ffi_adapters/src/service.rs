@@ -35,19 +35,25 @@ Registry::with_access 实际访问内，唯一一次读取已登记的 Arc<T> �
 Rust 共享持有。取得和归还受控 C 对象沿 B1；后续使用遵守原生终端的合同。
 本地 Clone 共享本次已接收的 B1 持有并克隆同一 Arc<T>，无新增登记。
 插件从原生接口得到可独立持有的句柄或回调时，须保留对应的 Terminal 以保持本轮
-持有。标准关闭期间由插件停止本轮的业务接纳，用同一终端完成撤回，确认其派生
-持有与引用退出，最后归还 Terminal。终端管理权和其他使用者归外部拥有方。
+持有。服务（services）的实现、注册（registration）、管理和注销（unregistration）
+完全属于插件（plugin）内部。标准关闭（close）的实际返回由插件（plugin）决定，
+本库不检查内部清单或状态（states）。归还 Terminal 前仍须满足派生持有与引用的
+存续条件；终端（terminal）管理权和其他使用者归外部拥有方。
 
-静态声明。在标准初始化接线内，封装者以实际插件自身的 inventory 表，
-或者该插件编译时给出的明确清单，提供完整的静态声明。采用明确清单的
-构建须保证插件的初始化构造器不向共享 inventory 表提交节点。两种合法
-装配及适用的加载配置由 B5 在装入插件前核对。汇总在插件 Rust 代码内
-发生。空集合正常返回。非空时把完整集合和原生终端一次交给配套框架的
-批量注册入口。出现分配失败用 pi_result，发生在调用框架前。插件包装
-代码在调用框架前建立本轮登记记录，保存逐项注册标识和失败时实际进度。
-在标准关闭入口中由插件根据其记录向框架撤回，框架负责确认原引用退出。
-本模块提供装拆包和一次静态汇总登记的 Rust 接入；插件拥有登记记录、
-撤回及清理进度。宿主管理流程使用标准关闭结果及 B1 受控持有。
+可选的静态声明（static declarations）汇总。插件（plugin）可在自己的 Rust
+代码中调用 register_static，也可直接使用原生接口（native APIs）。采用本函数时，
+传入插件（plugin）自身的 inventory 迭代项（iterator items）或构建时确定的明确清单。实际装配仍须
+保证收集表、节点、分配器（allocator）和相关代码的存续；采用明确清单不能抵消
+加载构造器（loading constructor）向共享表提交节点的实际效果。B5 核对的是配套
+构建（matching build），不枚举插件（plugin）的业务清单或内部状态（states）。
+本函数只收集一次：空集合（empty collection）成功；非空集合（nonempty collection）交给插件（plugin）提供的 register 闭包
+（closure）一次，并原样传播其 pi_result。收集时分配失败（allocation failure）发生在闭包（closure）
+之前。本函数不初始化（initialize）服务（services），也不确认业务就绪（business readiness）或保证整批效果。
+服务（services）的实际管理及失败进度由插件（plugin）自行负责，对外完全透明。
+静态服务（static services）声明并注册（registration）后在当前 P2P 主机网络（P2P host network）
+中不注销（unregistration），可暂停或暂时停止。动态服务（dynamic services）可在运行时（runtime）
+注销（unregistration）。本库不要求额外的登记（registration）、撤回（withdrawal）或完成接口（APIs）；宿主（host）管理流程仅使用
+标准 C 接口（C APIs）的实际结果及本库自身 B1 持有与调用事实。
 */
 
 #[path = "service_inner.rs"]
@@ -158,8 +164,9 @@ impl PublishedTerminal {
 ///
 /// 按字段顺序先归还本地 Rust 共享持有，再归还对应 B1 持有。插件可以在
 /// 自己的 Rust 代码中使用终端。还持有从终端取得的原生句柄（handle）、
-/// 引用或回调（callback）时，须保留对应的 `Terminal`。插件在标准关闭中
-/// 清理本轮登记和这些引用，再归还终端持有。
+/// 引用或回调（callback）时，须保留对应的 `Terminal`。归还终端（terminal）
+/// 持有前须满足这些派生对象的存续条件。服务（services）管理由插件（plugin）
+/// 内部负责；本库不要求静态注销（static unregistration）。
 pub struct Terminal<T> {
     terminal: Arc<T>,
     holding: Interface<TerminalInterface>,
@@ -215,14 +222,15 @@ impl Drop for RestoreInput<'_> {
     }
 }
 
-/// 汇总当前插件（plugin）的全部静态声明，交给对应终端的批量登记入口。
+/// 可选地汇总插件（plugin）的静态声明（static declarations），调用一次登记（registration）闭包（closure）。
 ///
-/// 在标准初始化的 Rust 接入内调用。传入自身收集表的迭代项或编译时确定的
-/// 明确清单。部署须先满足相应装配方式的归属和存续条件。空集合直接成功。
-/// 非空集合只调用一次 `register`。插件在调用前准备本轮的登记记录，并
-/// 保存已经生效的注册标识。框架须支持批量登记、精确撤回和确认相关引用
-/// 已退出。若登记发生错误或栈展开（stack unwinding），插件仍须能用本轮
-/// 记录查清实际进度。记录保留至确认清理完成，由插件在标准关闭入口使用。
+/// 插件（plugin）可在自己的 Rust 代码中使用本函数，也可直接使用原生接口（native APIs）。
+/// 传入自身收集表的迭代项（iterator items）或构建时确定的明确清单，并满足该装配的归属和存续条件。
+/// 空集合（empty collection）直接成功；非空集合（nonempty collection）只调用一次 `register`，其实际结果原样返回。
+/// 收集时分配失败（allocation failure）在调用闭包（closure）前返回。迭代（iteration）或闭包（closure）发生的
+/// 栈展开（stack unwinding）沿既有边界处理，已发生的实际效果仍由插件（plugin）负责。
+/// 本函数不判断服务（services）是否就绪（readiness），不要求静态注销（static unregistration），
+/// 不决定标准初始化接口（initialization API）或标准关闭接口（close API）的返回。
 // @trace 7
 pub fn register_static<T, D>(
     terminal: &Terminal<T>,

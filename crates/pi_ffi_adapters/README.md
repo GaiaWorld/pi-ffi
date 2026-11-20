@@ -13,7 +13,7 @@
 | 初始化轮次（initialization round） | 同一次标准初始化的实际输入以该轮身份绑定。重复请求沿原轮，另一次合法初始化使用新轮。 |
 | 配置（Config） | 宿主交给本轮的一份原生值。插件先用输入建立本轮连接，再取走该份配置。 |
 | Rust 共享持有（shared Rust ownership） | 终端及运行时的插件封装分别共享原生实例，派生的使用期按本轮保护延续。 |
-| 静态服务声明（static service declaration） | 插件在编译期提供的服务条目集合，在该插件的标准初始化中汇总并交给实际框架批量登记。 |
+| 静态服务声明（static service declaration） | 插件（plugin）编译期提供的服务（services）条目；注册（registration）、初始化（initialization）及管理（management）由插件（plugin）自行负责。 |
 
 ## Cargo 功能开关（features）
 
@@ -30,12 +30,12 @@
 
 调用低层的 `ConfigInput::from_input`、`Terminal::from_input` 或 `Runtime::from_optional_input` 接收有值输入时，遵守相应 `unsafe` 前提。参数来自 `with_input` 在同一同步初始化线程借出的本次原输入。外层保护覆盖原持有、来源代码、上下文和诊断表，两侧已核实配套构建、实际对象和分配方式。闭包（closure）中处理实际返回和诊断。取得配置后，插件按原生 Rust 接口使用。如果确认已经取走，但保护归还失败，也按实际进度处理原轮及原配置的清理。
 
-## 使用 P2P 终端与登记静态声明（Terminal and static services）
+## 使用 P2P 终端与静态声明（Terminal and static declarations）
 
 - `service::PublishedTerminal::publish` 接受已核实的实际 `Arc<P2pServiceTerminal<C, S>>`。通过 `with_input` 在标准调用中暂时借出。
 - `Terminal<T>::from_input` 使用配置建立的本轮连接，接收当前真实终端的一份持有。`Terminal::native` 在本地持有期内借用原终端，可使用其原生异步（asynchronous）接口。克隆（clone）继续共享本轮持有。
-- `register_static` 接收本插件的完整静态声明和实际框架的登记函数。空集合正常结束。非空在具备真实批量登记、精确撤回及引用退出确认的框架上，一次交给框架登记。可用来源为插件自有收集表或编译期明确清单。明确清单的实际构建需保证条目归属并符合共享表使用约定。
-- 插件每轮保存实际登记标识，关闭中按原标识撤回并确认在途及派生引用退出。持有原生终端派生的独立句柄（handle）、引用或回调（callback）时，保留对应 `Terminal` 至这些对象结束。动态服务（dynamic service）仍按外部框架的原生接口操作。
+- 插件（plugin）可选择使用 `register_static`，也可在自己的 Rust 代码中使用配套原生接口（native APIs）。本函数只收集一次静态声明（static declarations）：空集合（empty collection）直接成功；非空集合（nonempty collection）只调用一次插件（plugin）提供的闭包（closure），原样返回其 `pi_result`。收集时分配失败（allocation failure）发生在闭包（closure）前。条目可来自插件（plugin）自有收集表或编译期明确清单，仍须满足实际装配的归属和存续条件。本函数不保证整批操作的原子性（atomicity）、业务就绪（business readiness）或静态注销（static unregistration）；具体管理能力以配套版本的原生接口（native APIs）为准。
+- 全部服务（services）的实现（implementation）、注册（registration）、管理（management）和注销（unregistration）属于插件（plugin）内部，对宿主管理流程（host management flow）透明。静态服务（static services）在当前 P2P 主机网络（P2P host network）中不注销（unregistration），可暂停或暂时停止；动态服务（dynamic services）允许运行期（runtime）注销（unregistration）。标准初始化（initialization）和关闭（close）的实际返回由插件（plugin）决定，本库不检查内部清单或状态（states）。原生终端（terminal）派生的独立句柄（handles）、引用或回调（callbacks）仍须保留对应 `Terminal`，在归还持有前满足这些对象的存续条件。
 
 ```no_run
 use pi_ffi_adapters::service::{register_static, Terminal};
@@ -50,7 +50,7 @@ where
     T: Send + Sync + 'static,
 {
     // 真正接入时，T 是配套的原生 P2P 终端类型。
-    // 包装者预先备好本轮登记记录；登记函数写入框架确认的实际标识。
+    // 闭包（closure）由插件（plugin）提供，其实际效果（effects）和返回值（return values）由插件（plugin）处理。
     register_static(terminal, plugin_declarations, register_with_framework)
 }
 ```
