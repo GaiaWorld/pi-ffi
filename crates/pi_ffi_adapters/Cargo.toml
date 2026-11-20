@@ -2,6 +2,10 @@
 name = "pi_ffi_adapters"
 version.workspace = true
 edition.workspace = true
+description = "Rust 插件外部函数接口（FFI）的运行时（runtime）、配置（configuration）和服务终端（service terminal）适配"
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
 
 [lib]
 crate-type = ["dylib"]

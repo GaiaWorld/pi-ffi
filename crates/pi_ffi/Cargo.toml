@@ -2,6 +2,10 @@
 name = "pi_ffi"
 version.workspace = true
 edition.workspace = true
+description = "Rust 插件动态库（dynamic library）的加载、初始化（initialization）、关闭与宿主管理接口（host API）"
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
 
 [dependencies]
 parking_lot.workspace = true

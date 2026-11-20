@@ -2,6 +2,10 @@
 name = "pi_ffi_macros"
 version.workspace = true
 edition.workspace = true
+description = "生成 Rust 插件标准外部函数接口（FFI）入口的过程宏（procedural macros）"
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
 
 [lib]
 proc-macro = true

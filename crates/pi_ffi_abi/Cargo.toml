@@ -2,6 +2,10 @@
 name = "pi_ffi_abi"
 version.workspace = true
 edition.workspace = true
+description = "Rust 插件管理协议的 C 应用二进制接口（C ABI）类型与常量"
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
 
 [lib]
 path = "src/lib.rs"

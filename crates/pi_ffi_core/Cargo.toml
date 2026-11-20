@@ -2,6 +2,10 @@
 name = "pi_ffi_core"
 version.workspace = true
 edition.workspace = true
+description = "Rust 插件外部函数接口（FFI）的受控对象交接、调用保护与错误诊断"
+license.workspace = true
+license-file.workspace = true
+repository.workspace = true
 
 [dependencies]
 pi_ffi_abi.workspace = true
