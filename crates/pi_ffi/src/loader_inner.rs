@@ -1,7 +1,7 @@
 use super::*;
 use crate::package::{BuildDependency, BuildFile, DependencyUse, Target};
 use object::{Architecture, BinaryFormat, ExportTarget, NameOrOrdinal, Object, ObjectKind};
-use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V1, METADATA_V1};
+use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V2, METADATA_V1};
 use pi_result::{attachment::PathAttachment, Error, ErrorKind};
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
@@ -208,7 +208,7 @@ fn check_exports(binary: &object::File<'_>) -> Result<()> {
     use object::ObjectSection;
     let expected = [
         METADATA_V1.to_bytes(),
-        INITIALIZE_V1.to_bytes(),
+        INITIALIZE_V2.to_bytes(),
         CLOSE_V1.to_bytes(),
     ];
     let mut found = [false; 3];
@@ -394,14 +394,14 @@ pub(super) fn verify_image(
     let required = required_linked_dependencies(&files)?;
     let dependencies = verify_mapped_dependencies(&files, |index, _| required[index])?;
     let metadata = verify_entry(module, identity, METADATA_V1)?;
-    let initialize = verify_entry(module, identity, INITIALIZE_V1)?;
+    let initialize = verify_entry(module, identity, INITIALIZE_V2)?;
     let close = verify_entry(module, identity, CLOSE_V1)?;
     // SAFETY: 受管制品的三个直接导出（direct exports）有固定 C 签名。
     // 入口地址均已核对归属于本次持有的同一实际文件。
     let entries = unsafe {
         Entrypoints {
             metadata: std::mem::transmute::<*const core::ffi::c_void, MetadataFnV1>(metadata),
-            initialize: std::mem::transmute::<*const core::ffi::c_void, InitializeFnV1>(initialize),
+            initialize: std::mem::transmute::<*const core::ffi::c_void, InitializeFnV2>(initialize),
             close: std::mem::transmute::<*const core::ffi::c_void, CloseFnV1>(close),
         }
     };
@@ -433,7 +433,7 @@ pub(super) fn check_inputs(image: &VerifiedImage, has_runtime: bool) -> Result<(
             "linked dependency mapping changed",
         ));
     }
-    // 配置（Config）与终端（terminal）的宿主适配代码来自同一 Rust 动态库（dylib）。
+    // 配置（Config）、终端（terminal）和数据（data）的宿主适配代码来自同一 Rust 动态库（dylib）。
     // 以宿主实际代码地址核对该制品。分配器（allocator）约定来自此前核准的不可变构建记录。
     let host_adapter = mapped_address_identity(
         pi_ffi_adapters::config::ConfigInput::take as *const core::ffi::c_void,

@@ -22,23 +22,28 @@
 
 ## 插件公开的三个入口（Management exports）
 
-`management` 模块的 `METADATA_V1`、`INITIALIZE_V1` 和 `CLOSE_V1` 是 `&CStr` 类型的精确 C 符号（C symbol）。对应导出函数类型分别是 `MetadataFnV1`、`InitializeFnV1` 和 `CloseFnV1`。同一产物提供唯一一套导出，宿主在实际模块有效期间核符号归属，按该函数类型调用。
+`management` 模块的 `METADATA_V1`、`INITIALIZE_V2` 和 `CLOSE_V1` 是 `&CStr` 类型的精确 C 符号（C symbol）。对应导出函数类型分别是 `MetadataFnV1`、`InitializeFnV2` 和 `CloseFnV1`。同一产物提供唯一一套导出，宿主在实际模块有效期间核符号归属，按该函数类型调用。
 
 | 声明 | 入参与返回 |
 | --- | --- |
 | `MetadataV1` | 输出槽接收稳定 UUID、版本字节地址和字节长度。版本是完整 UTF-8 语义化版本（SemVer），宿主在模块保护内复制。 |
-| `InitializeFnV1`、`InitReplyV1` | 依次传运行时、终端和配置的只读 `ObjectRefV1` 指针。首项可为空。后两项必传。结果独立给出进度与 `OutcomeV1`。 |
+| `InitializeFnV2`、`InitReplyV1` | 依次传运行时、终端、配置和初始化数据（initialization data）的只读 `ObjectRefV1` 指针。首项可为空，其余必传，包括数据为 `()` 时。结果独立给出进度与 `OutcomeV1`。 |
 | `INIT_NOT_STARTED`、`INIT_COMPLETED`、`INIT_NEEDS_CLOSE` | 依次表示明确未开始、已经完成、原轮可能有效果需关闭。成功只能与 `INIT_COMPLETED` 配对。 |
 | `CloseFnV1` | 传宿主已持有的原轮 `InitIdV1`，接收标准结果。旧标识只能作用于原轮。 |
 
 ```rust
-use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V1, METADATA_V1};
+use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V2, METADATA_V1};
 
 // 这些名字是构建产物中的实际 C 符号。查询时使用完整名称。
 assert_eq!(METADATA_V1.to_bytes(), b"pi_ffi_metadata_v1");
-assert_eq!(INITIALIZE_V1.to_bytes(), b"pi_ffi_initialize_v1");
+assert_eq!(INITIALIZE_V2.to_bytes(), b"pi_ffi_initialize_v2");
 assert_eq!(CLOSE_V1.to_bytes(), b"pi_ffi_close_v1");
 ```
+
+历史 `INITIALIZE_V1`／`InitializeFnV1` 保留准确的三参数声明。新加载流程只接受
+v2，不回退（fallback）；新旧不配套时在初始化调用前拒绝。第四项复用共同对象表示，
+不改变 `ObjectRefV1`、`InitReplyV1`、元信息或关闭的布局（layout），也不在 C 参数中
+直接传输任意 Rust 类型的内存布局。实际类型、配套构建及分配器前提见 `pi_ffi` 的用法。
 
 ## 身份、借用与公共操作（Identity and access）
 

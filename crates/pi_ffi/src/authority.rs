@@ -280,6 +280,8 @@ pub(crate) struct PreparedInputs {
     pub(crate) config: PublishedConfig,
     pub(crate) terminal: PublishedTerminal,
     pub(crate) runtime: Option<PublishedRuntime>,
+    // 初始化数据（initialization data）的本轮原始持有（holding），沿来源归还路径保管。
+    pub(crate) data: pi_ffi_adapters::data::PublishedData,
 }
 
 #[derive(Clone, Copy)]

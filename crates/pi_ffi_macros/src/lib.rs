@@ -31,7 +31,8 @@ struct InvalidExport {
     message: String,
 }
 
-/// 用钩子（hook）和声明生成三个 v1 标准导出及对应 Rust 签名检查。
+/// 用钩子（hook）和声明生成三个标准导出及对应 Rust 签名检查：
+/// 元信息（metadata）v1、初始化（initialization）v2、关闭（close）v1。
 ///
 /// 必填项为 `declaration`、`state`、`initialize`、`close` 和 `runtime`。
 /// `declaration` 指向 `pi_ffi::plugin::Declaration` 常量。`state` 是插件
@@ -40,7 +41,9 @@ struct InvalidExport {
 ///
 /// `runtime: none` 使用 `Exports::initialize_without_runtime`，只接收缺省运行时。
 /// `runtime: optional(RuntimeType)` 用指定类型调用
-/// `Exports::initialize::<_, RuntimeType>`，允许有无运行时。
+/// `Exports::initialize::<_, RuntimeType, _>`，允许有无运行时（runtime）。
+/// 初始化数据（initialization data）D 从回调（callback）的 `Inputs<T,R,D>` 推断，
+/// 只要求 `Send + Sync + 'static`，不增加宏字段（macro field）或 `Clone` 要求。
 /// `api` 可省略，默认用 `::pi_ffi`。依赖改名时显式提供对应 Rust 路径。
 /// 每个插件动态库只生成一份标准导出，手工定义同名导出时使用手工入口。
 /// 生成的边界继续遵循配套构建、可信部署以及插件自己的退出合同。
@@ -75,7 +78,8 @@ impl Parse for PluginDeclaration {
 
 输出在一个匿名常量内持有一份静态 Exports<状态类型>。只生成三项
 unsafe extern "C" 函数，用 #[unsafe(export_name = "…")] 指定三个标准
-v1 名称，分别委托元信息、选定的初始化方法和关闭。对每项赋予
+元信息（metadata）v1、初始化（initialization）v2、关闭（close）v1 的名称，
+分别委托相应入口。对每项赋予
 pi_ffi::abi 中对应的函数指针类型。标准库名默认绝对路径。保留调用方
 输入的路径、类型及位置。递归比较输入标记树内的标识，按 Rust 原始标识
 的真实名称比较。生成的 Rust 项名和参数名避开这些名字且各自唯一。

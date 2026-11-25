@@ -24,14 +24,15 @@ B1 的持续记录中推进。PendingConfig 的关闭只确认可以清理该条
 TLS 不可用报 InvalidState。结束短期 RefCell 借用后才进入闭包、销毁替换的记录
 或归还 B1 持有。须在借用范围内保存标准初始化结果、诊断和已经发生的操作。
 
-接收。标准入口先核两项必传入参，再由 ConfigInput::from_input 核对其收到的
+接收。标准入口先核全部必传入参，再由 ConfigInput::from_input 核对其收到的
 同步借用地址恰是本线程最内层借出的配置。无匹配报 Conflict，TLS 不可用报
 InvalidState。此检查不解引用登记的地址，通过后才按字段重建 Connection 引导
 所需的临时值，沿 B1 建立连接，取得独立持有并查询准确的只读 ConfigInterface 表头。
 重建值仍借用同一原持有。连接有自己的 B1 独立持有；用于取用的接口持有仅在
 ConfigInput 存活时保留。构造失败由已有的责任记录处理实际已取得的持有。
 B5 在 take 前核对终端及已提供的运行时属于本轮，并取得相应 Rust 输入。
-两个输入的核对不消费配置。配置收到与否及内容是否合适是两个问题，空配置可以交接。
+这些输入的核对不消费配置（Config）。初始化数据（initialization data）D 的预核与
+取用由上层先完成，随后才取配置（Config）。配置收到与否及内容是否合适是两个问题，空配置可以交接。
 
 取用。ConfigInput 借用真实输入，限当前调用和线程。take 消费壳，经 Interface
 取得代码保护，来源先核同一借用地址仍在最内层，再用 Registry::with_access 对
@@ -199,13 +200,14 @@ impl<'call> ConfigInput<'call> {
         })
     }
 
-    /// 借用当前共同连接（connection），用于建立同一轮的另两项输入。
+    /// 借用当前共同连接（connection），用于建立同一轮的其余输入。
     // @trace 4
     pub fn connection(&self) -> &Connection {
         inner::connection(self)
     }
 
-    /// 在终端及已提供的运行时（runtime）输入核对后，取出这一轮的配置（Config）。
+    /// 在终端（terminal）、已提供的运行时（runtime）及数据（data）预核后，
+    /// 由上层先接收数据（data），再取出这一轮的配置（Config）。
     ///
     /// 成功后由插件（plugin）持有原生配置。取出后若保护归还失败，则报告
     /// `pi_result`，接收侧清理该份配置，该轮继续按已发生的取用处理。

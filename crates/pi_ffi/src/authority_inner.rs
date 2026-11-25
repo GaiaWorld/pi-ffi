@@ -3666,6 +3666,8 @@ fn finish_source_maintenance(authority: &Authority, source: &SourceWork, pending
 mod residency_tests {
     //! 用本地 Rust 共享库（shared library）核对装入、引用与退役状态。
 
+    include!("authority_data_tests.rs");
+
     use super::*;
     use crate::{
         host::Manager,
@@ -3715,7 +3717,8 @@ unsafe extern "C" fn pi_ffi_metadata_v1(out: *mut MetadataV1) -> OutcomeV1 {
 }
 
 #[no_mangle]
-extern "C" fn pi_ffi_initialize_v1(
+extern "C" fn pi_ffi_initialize_v2(
+    _: *const ObjectRefV1,
     _: *const ObjectRefV1,
     _: *const ObjectRefV1,
     _: *const ObjectRefV1,

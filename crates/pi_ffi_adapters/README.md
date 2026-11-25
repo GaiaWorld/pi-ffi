@@ -2,7 +2,7 @@
 
 ## 用途与支持环境（Scope and support）
 
-`pi_ffi_adapters` 安全交接 Rust 插件动态库（plugin dynamic library）初始化所需的三类原生对象。配置（Config）和 P2P 终端（P2P service terminal）必传，运行时（runtime）可选。用于实现宿主（host）和插件的标准初始化接入，普通调用方可通过 `pi_ffi` 使用这些类型。
+`pi_ffi_adapters` 安全交接 Rust 插件动态库（plugin dynamic library）初始化所需的四类原生输入。配置（Config）、P2P 终端（P2P service terminal）和初始化数据（initialization data）D 必传，运行时（runtime）可选。用于实现宿主（host）和插件的标准初始化接入，普通调用方可通过 `pi_ffi` 使用这些类型。
 
 首批目标为 Linux x86_64／GNU 和 Windows x86_64／MSVC。库采用 Rust 2021 版次（edition），已验证的编译器为 Rust `1.99.0-nightly`（`eff8269f7`）。最低支持 Rust 版本（MSRV）尚未确定。宿主与插件须配套构建（matching build），实际使用同一份 Rust 适配库（adapter crate）、相应原生依赖和分配约定。当前配置使用 `pi_config 0.7`，运行时特征（trait）来自 `pi-async-rt_v1.0` 的 `pi-async-runtime-core`。
 
@@ -29,6 +29,32 @@
 | `ConfigInput::take` | 先用本轮连接通过 `Terminal::from_input` 接收终端，通过 `Runtime::from_optional_input` 接收已提供的运行时。成功后才移动取得本轮唯一的一份配置。同一轮重复取用按 `pi_result` 报告。 |
 
 调用低层的 `ConfigInput::from_input`、`Terminal::from_input` 或 `Runtime::from_optional_input` 接收有值输入时，遵守相应 `unsafe` 前提。参数来自 `with_input` 在同一同步初始化线程借出的本次原输入。外层保护覆盖原持有、来源代码、上下文和诊断表，两侧已核实配套构建、实际对象和分配方式。闭包（closure）中处理实际返回和诊断。取得配置后，插件按原生 Rust 接口使用。如果确认已经取走，但保护归还失败，也按实际进度处理原轮及原配置的清理。
+
+## 初始化数据（Initialization data）
+
+`data::PublishedData::publish(connection, data)` 接管双方协商的原 D，`with_input` 在
+受保护的同步调用中借出该份数据的 C 表示。`DataInput::<D>::from_input` 预核本轮
+来源、原始借用和真实类型，不消费数据。`take_into(&mut output)` 将原值移到空的
+`Option<D>`；目标非空或已取走返回 `InvalidState`，错类型返回 `Conflict`。
+
+D 只要求 `Send + Sync + 'static`，不要求 `Clone`、`Default` 或序列化（serialization）。
+共享由具体 D 决定，例如 `Arc<T>`；无内容传 `()`，仍有合法第四输入。
+两侧必须核同一实际定义、配套构建（matching build）、分配器（allocator）和间接析构／
+回调代码的存续；类型身份检查不能独立证明任意 Rust 布局兼容。
+
+```no_run
+use pi_ffi_adapters::data::DataInput;
+use pi_result::Result;
+
+fn receive<D: Send + Sync + 'static>(input: DataInput<'_, D>, output: &mut Option<D>) -> Result<()> {
+    input.take_into(output)
+}
+```
+
+即使 `take_into` 返回错误，输出也可能已经是 `Some(D)`，调用方须依据实际输出交付
+或受保护清理，不能当作没有消费。通常由 `pi_ffi::plugin::Exports` 统一处理，不必自行
+编排低层接收。全部输入预核后，首次消费前须保留实际进度，先取 D，再取配置。
+交给插件以后，数据的保存、使用和业务退出属于插件内部语义。
 
 ## 使用 P2P 终端与静态声明（Terminal and static declarations）
 

@@ -8,4 +8,4 @@ mod package;
 pub mod plugin;
 
 pub use pi_ffi_abi::management as abi;
-pub use pi_ffi_adapters::{config, runtime, service};
+pub use pi_ffi_adapters::{config, data, runtime, service};

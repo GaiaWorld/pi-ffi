@@ -24,10 +24,12 @@ pub struct Declaration {
 }
 
 /// 已按本轮核验并接收的原生 Rust 初始化输入。
-pub struct Inputs<T, R = ()> {
+pub struct Inputs<T, R = (), D: Send + Sync + 'static = ()> {
     pub terminal: Terminal<T>,
     pub config: Config,
     pub runtime: Option<Runtime<R>>,
+    /// 双方协商类型的初始化数据（initialization data），按值取得，不要求 `Clone`。
+    pub data: D,
 }
 
 /// 插件实现方在本模块声明一份。S 为插件自有状态，宿主不接触。
@@ -55,6 +57,8 @@ struct BoundInputs {
     config: LeaseV1,
     terminal: LeaseV1,
     runtime: Option<LeaseV1>,
+    // 初始化数据（initialization data）的完整租约（lease），用于同轮重放（replay）绑定。
+    data: LeaseV1,
 }
 
 enum PluginPhase {
@@ -69,7 +73,13 @@ enum PluginPhase {
 
 /*
 输入必传项、完整持有与同一权威先于实际初始化。重复调用不接收另一份配置。
-先接收终端和有值的运行时，再取走配置并调用插件逻辑。单一短锁保留初始化或关闭资格及实际进度。业务函数、C 回调和状态析构在锁外。
+先预核终端（terminal）、有值的运行时（runtime）及初始化数据（initialization data）D。
+首次可能消费前记 INIT_NEEDS_CLOSE，先取 D，再取配置（Config），最后交给插件（plugin）。
+接收中的 Option<D> 保存在边界（boundary）保护闭包外，交付前失败时另行保护析构（Drop）。
+析构（Drop）失败先固定 CleanupFailed/close_failure，再处理诊断（diagnostic）；
+通用结算和关闭（close）不能把该失败覆盖为成功。交付以后 D 的业务语义完全透明。
+单一短锁（lock）保留初始化（initialization）或关闭（close）资格及实际进度，
+业务函数、C 回调（callback）和状态析构（Drop）在锁外。
 开始调用插件逻辑前预留本轮记录。插件记录已发生的资源和服务登记，便于发生
 失败或栈展开后关闭。关闭检查对应标识，旧轮回放不会操作新轮。
 
@@ -109,37 +119,45 @@ impl<S: Send + 'static> Exports<S> {
     /// # Safety
     ///
     /// 非空输入由遵约宿主按同轮条件保活至返回。接入应在本次调用线程拆包。
+    /// 通过预核的 D 是双方约定的同一实际类型，配套 Rust 构建（matching build）、分配器
+    /// （allocator）及其析构／回调代码（drop/callback code）存续至最后使用。
+    /// 数据为 `()` 时也须提供第四输入；只有运行时（runtime）可以为空。
+    /// 登记类型与 D 不同会在消费前返回 `Conflict`，不要求调用者提前证明二者相等。
     /// 插件必须能通过自己的关闭入口回收实际发生的所有效果。
     // @trace 6
-    pub unsafe fn initialize<T, R>(
+    pub unsafe fn initialize<T, R, D>(
         &self,
         runtime: *const ObjectRefV1,
         terminal: *const ObjectRefV1,
         config: *const ObjectRefV1,
-        initialize: impl FnOnce(Inputs<T, R>, &mut Option<S>) -> Result<()>,
+        data: *const ObjectRefV1,
+        initialize: impl FnOnce(Inputs<T, R, D>, &mut Option<S>) -> Result<()>,
     ) -> InitReplyV1
     where
         T: Send + Sync + 'static,
         R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+        D: Send + Sync + 'static,
     {
-        unsafe { inner::export_initialize(self, runtime, terminal, config, initialize) }
+        unsafe { inner::export_initialize(self, runtime, terminal, config, data, initialize) }
     }
 
-    /// 插件只接受省略运行时的输入。终端和配置仍须按本轮交接。
+    /// 插件（plugin）只接受省略运行时（runtime）的输入。
+    /// 终端（terminal）、配置（Config）和数据（data）仍须按本轮交接。
     ///
     /// # Safety
     ///
     /// 同 initialize 的输入存续及本轮清理合同。
     // @trace 8
-    pub unsafe fn initialize_without_runtime<T: Send + Sync + 'static>(
+    pub unsafe fn initialize_without_runtime<T: Send + Sync + 'static, D: Send + Sync + 'static>(
         &self,
         runtime: *const ObjectRefV1,
         terminal: *const ObjectRefV1,
         config: *const ObjectRefV1,
-        initialize: impl FnOnce(Inputs<T>, &mut Option<S>) -> Result<()>,
+        data: *const ObjectRefV1,
+        initialize: impl FnOnce(Inputs<T, (), D>, &mut Option<S>) -> Result<()>,
     ) -> InitReplyV1 {
         unsafe {
-            inner::export_initialize_without_runtime(self, runtime, terminal, config, initialize)
+            inner::export_initialize_without_runtime(self, runtime, terminal, config, data, initialize)
         }
     }
 

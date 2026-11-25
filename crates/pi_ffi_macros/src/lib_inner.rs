@@ -20,12 +20,13 @@ pub(super) fn export_plugin(input: TokenStream) -> TokenStream {
     collect_identifiers(tokens, &mut existing);
     let exports = fresh_name("__pi_ffi_exports_v1", &mut existing);
     let metadata = fresh_name("__pi_ffi_metadata_v1", &mut existing);
-    let initialize = fresh_name("__pi_ffi_initialize_v1", &mut existing);
+    let initialize = fresh_name("__pi_ffi_initialize_v2", &mut existing);
     let close = fresh_name("__pi_ffi_close_v1", &mut existing);
     let out = fresh_name("__pi_ffi_out", &mut existing);
     let runtime_ptr = fresh_name("__pi_ffi_runtime", &mut existing);
     let terminal_ptr = fresh_name("__pi_ffi_terminal", &mut existing);
     let config_ptr = fresh_name("__pi_ffi_config", &mut existing);
+    let data_ptr = fresh_name("__pi_ffi_data", &mut existing);
     let init_id = fresh_name("__pi_ffi_init_id", &mut existing);
 
     let PluginDeclaration {
@@ -38,10 +39,10 @@ pub(super) fn export_plugin(input: TokenStream) -> TokenStream {
     } = declaration;
     let initialize_body = match runtime {
         RuntimeParameter::None => quote! {
-            #exports.initialize_without_runtime(#runtime_ptr, #terminal_ptr, #config_ptr, #start)
+            #exports.initialize_without_runtime(#runtime_ptr, #terminal_ptr, #config_ptr, #data_ptr, #start)
         },
         RuntimeParameter::Optional(runtime) => quote! {
-            #exports.initialize::<_, #runtime>(#runtime_ptr, #terminal_ptr, #config_ptr, #start)
+            #exports.initialize::<_, #runtime, _>(#runtime_ptr, #terminal_ptr, #config_ptr, #data_ptr, #start)
         },
     };
     quote! {
@@ -53,11 +54,12 @@ pub(super) fn export_plugin(input: TokenStream) -> TokenStream {
                 unsafe { #exports.metadata(#out) }
             }
 
-            #[unsafe(export_name = "pi_ffi_initialize_v1")]
+            #[unsafe(export_name = "pi_ffi_initialize_v2")]
             unsafe extern "C" fn #initialize(
                 #runtime_ptr: *const #api::abi::ObjectRefV1,
                 #terminal_ptr: *const #api::abi::ObjectRefV1,
                 #config_ptr: *const #api::abi::ObjectRefV1,
+                #data_ptr: *const #api::abi::ObjectRefV1,
             ) -> #api::abi::InitReplyV1 {
                 unsafe { #initialize_body }
             }
@@ -68,7 +70,7 @@ pub(super) fn export_plugin(input: TokenStream) -> TokenStream {
             }
 
             const _: #api::abi::MetadataFnV1 = #metadata;
-            const _: #api::abi::InitializeFnV1 = #initialize;
+            const _: #api::abi::InitializeFnV2 = #initialize;
             const _: #api::abi::CloseFnV1 = #close;
         };
     }.into()

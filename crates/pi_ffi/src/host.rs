@@ -120,30 +120,36 @@ impl Plugin {
         inner::plugin_metadata(self)
     }
 
-    /// 为一轮初始化交出配置、终端和可选运行时。该轮尚未调用插件。
+    /// 为一轮初始化（initialization）交出配置（Config）、终端（terminal）、
+    /// 可选运行时（runtime）和初始化数据（initialization data）D，尚未调用插件（plugin）。
+    /// D 按值交出，不要求 `Clone`；共享方式由实际类型决定。失败不承诺退回原值。
     /// 已被占用的完整版本不能另开一轮。
     // @trace 8
-    pub fn prepare<T, R>(
+    pub fn prepare<T, R, D>(
         &self,
         terminal: TerminalInput<T>,
         config: Config,
         runtime: Option<Arc<R>>,
+        data: D,
     ) -> Result<Initialization>
     where
         T: Send + Sync + 'static,
         R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+        D: Send + Sync + 'static,
     {
-        inner::plugin_prepare::<T, R>(self, terminal, config, runtime)
+        inner::plugin_prepare::<T, R, D>(self, terminal, config, runtime, data)
     }
 
-    /// 装包不含运行时的初始化输入。终端与配置仍必传。
+    /// 省略运行时（runtime）的初始化（initialization）；终端（terminal）、配置
+    /// （Config）及数据（data）仍必传。无数据内容时传 `()`，失败不承诺退回原值。
     // @trace 9
-    pub fn prepare_without_runtime<T: Send + Sync + 'static>(
+    pub fn prepare_without_runtime<T: Send + Sync + 'static, D: Send + Sync + 'static>(
         &self,
         terminal: TerminalInput<T>,
         config: Config,
+        data: D,
     ) -> Result<Initialization> {
-        inner::plugin_prepare_without_runtime::<T>(self, terminal, config)
+        inner::plugin_prepare_without_runtime::<T, D>(self, terminal, config, data)
     }
 
     /// 取本模块仍需处理的初始化轮次，包括初始化未完成而需要关闭的轮次。

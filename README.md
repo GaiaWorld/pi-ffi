@@ -47,10 +47,21 @@
 | 入口 | 已对齐的使用约定 |
 | --- | --- |
 | `pi_ffi_metadata_v1` 只读元信息（read-only metadata） | 提供稳定身份声明及完整语义化版本号（semantic version）；在合法加载期间的初始化前、中、后及关闭期间、关闭后都可查询，不以业务初始化为前提 |
-| `pi_ffi_initialize_v1` 初始化 | 接收必传的 `pi-p2p-service` 终端实例（terminal instance）、`pi_config::Config` 及可选的外部运行时（runtime）。返回实际初始化进度以及共同结果。宿主准备输入时已获得本轮标识（initialization identifier），需要继续清理时按原标识关闭 |
+| `pi_ffi_initialize_v2` 初始化 | 按运行时、终端、配置、初始化数据（initialization data）顺序接收四个受控对象指针；仅运行时可为空，数据为 `()` 时也必传。返回实际初始化进度及共同结果，按原轮标识继续清理 |
 | `pi_ffi_close_v1` 关闭 | 接收本次初始化的标识（initialization identifier），明确返回成功或失败；旧标识（identifier）的延迟调用不能关闭新一轮使用 |
 
-外部函数接口（FFI）采用目标平台的 C 应用二进制接口（C ABI）和受控表示。运行时（runtime）可省略，终端（terminal）和配置（Config）必传。由标准 Rust 接入核对本轮登记并接收真实对象，`Config` 在同一轮只移交一次。`repr(C)` 本身也不会使其内部嵌套的任意 Rust 类型（type）具备稳定表示。参见 [Rust 类型布局（type layout）说明](https://doc.rust-lang.org/reference/type-layout.html#representations)。
+外部函数接口（FFI）采用目标平台的 C 应用二进制接口（C ABI）和受控表示。运行时（runtime）可省略，终端（terminal）、配置（Config）和初始化数据（initialization data）必传。由标准 Rust 接入核对本轮登记并接收真实对象，`Config` 与 D 在同一轮分别只移交一次。`repr(C)` 本身也不会使其内部嵌套的任意 Rust 类型（type）具备稳定表示。参见 [Rust 类型布局（type layout）说明](https://doc.rust-lang.org/reference/type-layout.html#representations)。
+
+Rust 宿主（host）使用 `prepare(terminal, config, runtime, data)` 或
+`prepare_without_runtime(terminal, config, data)`，插件（plugin）通过
+`Inputs<T,R,D>::data` 接收原 D。只要求 `D: Send + Sync + 'static`，不要求 `Clone`。
+双方约定 `D = Arc<T>` 时可共享同一实际对象；无内容显式传 `()`。类型定义、配套
+Rust 构建（matching build）、分配器（allocator）及析构／回调代码存续须由双方核实。
+旧调用补末尾参数，手工导出改为四指针 `pi_ffi_initialize_v2`／`InitializeFnV2`；
+过程宏（procedural macro）从初始化函数推断 D，不新增字段。旧 v1 声明保留，新装载器
+（loader）不回退。完整可编译示例与迁移说明见 [pi_ffi](crates/pi_ffi/README.md) 和
+[pi_ffi_macros](crates/pi_ffi_macros/README.md)。`pi_result` 按代码需要显式依赖，使用宏时
+另外依赖 `pi_ffi_macros`；`pi_ffi` 重导出原生适配模块（adapter modules），不重导出过程宏。
 
 标准入口名称区分协议主版本（protocol major version）；同一主版本内固定调用约定（calling convention）及参数、返回值的布局（layout）。不兼容变化使用新的入口版本（entry version），它与外部产物自身的业务版本（business version）分别判断。完整声明见 [三个标准 C 接口](crates/pi_ffi_abi/src/management.rs)。
 
@@ -70,7 +81,7 @@
 
 ## 选择接入方法
 
-宿主使用 `pi_ffi::host` 装入可信插件包，提供原生 P2P 终端、配置和可选运行时。载入前核对实际发布制品和依赖，保留原轮次句柄用于失败后的关闭。关闭完成并确认引用退出后，再显式释放本库的系统引用。 [宿主和手工封装示例](crates/pi_ffi/README.md)。
+宿主（host）使用 `pi_ffi::host` 装入可信插件包（plugin package），提供原生 P2P 终端（terminal）、配置（Config）、初始化数据（initialization data）和可选运行时（runtime）。载入前核对实际发布制品和依赖，保留原轮次句柄用于失败后的关闭。关闭完成并确认引用退出后，再按包的选择退役本库的系统引用。 [宿主和手工封装示例](crates/pi_ffi/README.md)。
 
 包装库使用 Rust `cdylib`。手工接法用 `pi_ffi::plugin::Exports` 编写三个标准 C 导出，可选 `export_plugin!` 生成相同接线。一个插件产物提供一套导出。 [可选宏及示例](crates/pi_ffi_macros/README.md)。
 

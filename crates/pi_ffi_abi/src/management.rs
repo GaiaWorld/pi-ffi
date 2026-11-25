@@ -5,8 +5,10 @@ use core::ffi::CStr;
 
 /// 只读库元信息（read-only library metadata）的精确导出名。
 pub const METADATA_V1: &CStr = c"pi_ffi_metadata_v1";
-/// 初始化（initialization）的精确导出名。
+/// 历史三输入初始化（initialization）的精确导出名。
 pub const INITIALIZE_V1: &CStr = c"pi_ffi_initialize_v1";
+/// 四输入初始化（initialization）的精确导出名。当前加载流程只接收此版本。
+pub const INITIALIZE_V2: &CStr = c"pi_ffi_initialize_v2";
 /// 关闭（close）的精确导出名。
 pub const CLOSE_V1: &CStr = c"pi_ffi_close_v1";
 
@@ -43,5 +45,14 @@ pub type MetadataFnV1 = unsafe extern "C" fn(*mut MetadataV1) -> OutcomeV1;
 /// 三个输入按运行时、终端、配置排列。运行时可为空。
 pub type InitializeFnV1 =
     unsafe extern "C" fn(*const ObjectRefV1, *const ObjectRefV1, *const ObjectRefV1) -> InitReplyV1;
+/// 四个输入按运行时、终端、配置、初始化数据（initialization data）排列。
+/// 运行时可为空；其余必传，包括数据类型为 `()` 的情况。
+/// 每项借自同一次受保护的同步调用，不能用复制字段代替真实持有。
+pub type InitializeFnV2 = unsafe extern "C" fn(
+    *const ObjectRefV1,
+    *const ObjectRefV1,
+    *const ObjectRefV1,
+    *const ObjectRefV1,
+) -> InitReplyV1;
 /// 按初始化标识关闭，旧轮不能影响新轮。
 pub type CloseFnV1 = unsafe extern "C" fn(InitIdV1) -> OutcomeV1;

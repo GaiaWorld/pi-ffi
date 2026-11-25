@@ -4,7 +4,7 @@
 mod inner;
 
 use crate::package::{BuildManifest, HostBuild, Metadata, PluginPackage, UnloadPolicy};
-use pi_ffi_abi::management::{CloseFnV1, InitializeFnV1, MetadataFnV1, MetadataV1};
+use pi_ffi_abi::management::{CloseFnV1, InitializeFnV2, MetadataFnV1, MetadataV1};
 use pi_result::Result;
 use std::{fs::File, mem::ManuallyDrop, path::PathBuf, sync::Arc};
 
@@ -60,7 +60,7 @@ pub(crate) struct MappedIdentity {
 #[derive(Clone, Copy)]
 pub(crate) struct Entrypoints {
     pub(crate) metadata: MetadataFnV1,
-    pub(crate) initialize: InitializeFnV1,
+    pub(crate) initialize: InitializeFnV2,
     pub(crate) close: CloseFnV1,
 }
 

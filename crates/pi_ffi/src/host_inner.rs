@@ -8,7 +8,7 @@ use pi_ffi_abi::{
     ObjectRefV1,
 };
 use pi_ffi_adapters::{
-    config::PublishedConfig, runtime::PublishedRuntime, service::PublishedTerminal,
+    config::PublishedConfig, data::PublishedData, runtime::PublishedRuntime, service::PublishedTerminal,
 };
 use pi_ffi_core::{boundary, control::Connection, diagnostic};
 use pi_result::{attachment::Operation as ErrorOperation, Error, ErrorKind};
@@ -154,52 +154,60 @@ pub(super) fn plugin_metadata(plugin: &Plugin) -> &Metadata {
     &plugin.metadata
 }
 
-pub(super) fn plugin_prepare<T, R>(
+pub(super) fn plugin_prepare<T, R, D>(
     plugin: &Plugin,
     terminal: TerminalInput<T>,
     config: Config,
     runtime: Option<Arc<R>>,
+    data: D,
 ) -> Result<Initialization>
 where
     T: Send + Sync + 'static,
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
-    prepare_plugin(plugin, terminal, config, runtime.is_some(), |connection| {
+    prepare_plugin(plugin, terminal, config, data, runtime.is_some(), |connection| {
         runtime
             .map(|runtime| PublishedRuntime::publish(connection, runtime))
             .transpose()
     })
 }
 
-pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static>(
+pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static, D: Send + Sync + 'static>(
     plugin: &Plugin,
     terminal: TerminalInput<T>,
     config: Config,
+    data: D,
 ) -> Result<Initialization> {
-    prepare_plugin(plugin, terminal, config, false, |_| Ok(None))
+    prepare_plugin(plugin, terminal, config, data, false, |_| Ok(None))
 }
 
-fn prepare_plugin<T: Send + Sync + 'static>(
+fn prepare_plugin<T: Send + Sync + 'static, D: Send + Sync + 'static>(
     plugin: &Plugin,
     terminal: TerminalInput<T>,
     config: Config,
+    data: D,
     has_runtime: bool,
     publish_runtime: impl FnOnce(Connection) -> Result<Option<PublishedRuntime>>,
 ) -> Result<Initialization> {
     let authority = plugin.authority;
-    let (id, connection) = authority.reserve_round(plugin.epoch, has_runtime)?;
+    let mut reserved = None;
     let prepared = boundary::catch(
         boundary::Context {
             operation: "publish plugin initialization inputs",
-            module_epoch: id.module_epoch,
-            round: id.round,
+            module_epoch: plugin.epoch,
+            round: 0,
             source: 0,
         },
         || {
+            // 原值的接管及准备失败时的析构（Drop）均位于同一保护边界内。
+            let (id, connection) = authority.reserve_round(plugin.epoch, has_runtime)?;
+            reserved = Some(InitIdV1 { module_epoch: id.module_epoch, round: id.round });
             // 安全前提（safety）。同轮连接及实际配套已核对，原生输入由其配套代码持有。
             let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
             let terminal =
                 unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
+            let data = unsafe { PublishedData::publish(connection.clone(), data) }?;
             let runtime = publish_runtime(connection)?;
             authority.publish_inputs(
                 InitIdV1 {
@@ -210,17 +218,20 @@ fn prepare_plugin<T: Send + Sync + 'static>(
                     config,
                     terminal,
                     runtime,
+                    data,
                 },
             )
         },
     );
-    match prepared {
-        Ok(()) => Ok(Initialization {
+    match (prepared, reserved) {
+        (Ok(()), Some(id)) => Ok(Initialization {
             authority,
             epoch: id.module_epoch,
             round: id.round,
         }),
-        Err(failure) => Err(authority.fail_prepare(id, failure)),
+        (Err(failure), Some(id)) => Err(authority.fail_prepare(id, failure)),
+        (Err(failure), None) => Err(failure),
+        (Ok(()), None) => Err(Error::new(ErrorKind::Corrupted)),
     }
 }
 
@@ -338,7 +349,7 @@ fn initialize_with_inputs(authority: &Authority, call: &RoundCall) -> Result<()>
         .ok_or_else(|| Error::new(ErrorKind::Corrupted))?;
     loader::check_inputs(&call.image, inputs.runtime.is_some())?;
     inputs.config.with_input(|config| {
-        inputs
+        inputs.data.with_input(|data| inputs
             .terminal
             .with_input(|terminal| match &inputs.runtime {
                 Some(runtime) => runtime.with_input(|runtime| {
@@ -348,10 +359,11 @@ fn initialize_with_inputs(authority: &Authority, call: &RoundCall) -> Result<()>
                         std::ptr::from_ref(runtime),
                         terminal,
                         config,
+                        data,
                     )
                 }),
-                None => invoke_initialization(authority, call, std::ptr::null(), terminal, config),
-            })
+                None => invoke_initialization(authority, call, std::ptr::null(), terminal, config, data),
+            }))
     })
 }
 
@@ -361,10 +373,11 @@ fn invoke_initialization(
     runtime: *const ObjectRefV1,
     terminal: &ObjectRefV1,
     config: &ObjectRefV1,
+    data: &ObjectRefV1,
 ) -> Result<()> {
     authority.remember_progress(call, FfiProgress::OutcomeUnknown);
     // 安全前提（safety）。标准调用资格保活实际模块，所有原生输入处在嵌套同步借用中。
-    let reply = unsafe { (call.entries.initialize)(runtime, terminal, config) };
+    let reply = unsafe { (call.entries.initialize)(runtime, terminal, config, data) };
     let progress = match reply.progress {
         INIT_COMPLETED => FfiProgress::InitializationCompleted,
         INIT_NOT_STARTED if reply.outcome.kind != 0 => FfiProgress::InitializationNotStarted,

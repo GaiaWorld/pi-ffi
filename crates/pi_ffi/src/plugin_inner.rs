@@ -1,6 +1,6 @@
 use super::*;
 use pi_ffi_abi::management::{INIT_COMPLETED, INIT_NEEDS_CLOSE, INIT_NOT_STARTED};
-use pi_ffi_adapters::config::ConfigInput;
+use pi_ffi_adapters::{config::ConfigInput, data::DataInput};
 use pi_ffi_core::{
     boundary::{self, Context},
     control::Connection,
@@ -56,23 +56,26 @@ pub(super) unsafe fn export_metadata<S: Send + 'static>(
     )
 }
 
-pub(super) unsafe fn export_initialize<S, T, R>(
+pub(super) unsafe fn export_initialize<S, T, R, D>(
     exports: &Exports<S>,
     runtime: *const ObjectRefV1,
     terminal: *const ObjectRefV1,
     config: *const ObjectRefV1,
-    initialize: impl FnOnce(Inputs<T, R>, &mut Option<S>) -> Result<()>,
+    data: *const ObjectRefV1,
+    initialize: impl FnOnce(Inputs<T, R, D>, &mut Option<S>) -> Result<()>,
 ) -> InitReplyV1
 where
     S: Send + 'static,
     T: Send + Sync + 'static,
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
     initialize_export(
         exports,
         runtime,
         terminal,
         config,
+        data,
         initialize,
         |connection, runtime| {
             // 安全前提（safety）。本次仍由原宿主同步保活所传输入，并已核同轮连接。
@@ -84,12 +87,14 @@ where
 pub(super) unsafe fn export_initialize_without_runtime<
     S: Send + 'static,
     T: Send + Sync + 'static,
+    D: Send + Sync + 'static,
 >(
     exports: &Exports<S>,
     runtime: *const ObjectRefV1,
     terminal: *const ObjectRefV1,
     config: *const ObjectRefV1,
-    initialize: impl FnOnce(Inputs<T>, &mut Option<S>) -> Result<()>,
+    data: *const ObjectRefV1,
+    initialize: impl FnOnce(Inputs<T, (), D>, &mut Option<S>) -> Result<()>,
 ) -> InitReplyV1 {
     if !runtime.is_null() {
         let outcome = diagnostic::protect_outcome(
@@ -104,7 +109,7 @@ pub(super) unsafe fn export_initialize_without_runtime<
             outcome,
         };
     }
-    initialize_export(exports, runtime, terminal, config, initialize, |_, _| {
+    initialize_export(exports, runtime, terminal, config, data, initialize, |_, _| {
         Ok(None)
     })
 }
@@ -166,6 +171,7 @@ fn same_lease(left: &LeaseV1, right: &LeaseV1) -> bool {
 fn same_inputs(left: &BoundInputs, right: &BoundInputs) -> bool {
     same_lease(&left.config, &right.config)
         && same_lease(&left.terminal, &right.terminal)
+        && same_lease(&left.data, &right.data)
         && match (&left.runtime, &right.runtime) {
             (None, None) => true,
             (Some(left), Some(right)) => same_lease(left, right),
@@ -200,17 +206,19 @@ unsafe fn protected_input<'call>(input: *const ObjectRefV1) -> Result<&'call Obj
     Ok(input)
 }
 
-fn initialize_export<S, T, R>(
+fn initialize_export<S, T, R, D>(
     exports: &Exports<S>,
     runtime: *const ObjectRefV1,
     terminal: *const ObjectRefV1,
     config: *const ObjectRefV1,
-    initialize: impl FnOnce(Inputs<T, R>, &mut Option<S>) -> Result<()>,
+    data: *const ObjectRefV1,
+    initialize: impl FnOnce(Inputs<T, R, D>, &mut Option<S>) -> Result<()>,
     take_runtime: impl FnOnce(&Connection, Option<&ObjectRefV1>) -> Result<Option<Runtime<R>>>,
 ) -> InitReplyV1
 where
     S: Send + 'static,
     T: Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
     let mut progress = INIT_NOT_STARTED;
     let outcome =
@@ -219,6 +227,7 @@ where
                 // 安全前提（safety）。这里只借用由遵约宿主明确保活的原始同步参数。
                 let config = unsafe { protected_input(config) }?;
                 let terminal = unsafe { protected_input(terminal) }?;
+                let data = unsafe { protected_input(data) }?;
                 let runtime = if runtime.is_null() {
                     None
                 } else {
@@ -226,6 +235,7 @@ where
                 };
                 let id = &config.lease.initialization;
                 if !same_id(id, &terminal.lease.initialization)
+                    || !same_id(id, &data.lease.initialization)
                     || runtime.is_some_and(|runtime| !same_id(id, &runtime.lease.initialization))
                 {
                     return Err(plugin_error(
@@ -233,9 +243,9 @@ where
                         "match plugin input round",
                     ));
                 }
-                Ok((config, terminal, runtime))
+                Ok((config, terminal, runtime, data))
             })();
-            let (config, terminal, runtime) = match inputs {
+            let (config, terminal, runtime, data) = match inputs {
                 Ok(inputs) => inputs,
                 Err(error) => {
                     return diagnostic::limited_outcome(
@@ -249,6 +259,7 @@ where
                 config,
                 terminal,
                 runtime,
+                data,
                 initialize,
                 take_runtime,
                 &mut progress,
@@ -413,18 +424,20 @@ impl<S: Send + 'static> Drop for ExportAttempt<'_, S> {
     }
 }
 
-fn run_initialization<S, T, R>(
+fn run_initialization<S, T, R, D>(
     exports: &Exports<S>,
     config: &ObjectRefV1,
     terminal: &ObjectRefV1,
     runtime: Option<&ObjectRefV1>,
-    initialize: impl FnOnce(Inputs<T, R>, &mut Option<S>) -> Result<()>,
+    data: &ObjectRefV1,
+    initialize: impl FnOnce(Inputs<T, R, D>, &mut Option<S>) -> Result<()>,
     take_runtime: impl FnOnce(&Connection, Option<&ObjectRefV1>) -> Result<Option<Runtime<R>>>,
     progress: &mut u32,
 ) -> OutcomeV1
 where
     S: Send + 'static,
     T: Send + Sync + 'static,
+    D: Send + Sync + 'static,
 {
     let id = &config.lease.initialization;
     let fallback = Arc::new(ManagementFailure::capture(&plugin_error(
@@ -435,6 +448,7 @@ where
         config: copy_lease(&config.lease),
         terminal: copy_lease(&terminal.lease),
         runtime: runtime.map(|runtime| copy_lease(&runtime.lease)),
+        data: copy_lease(&data.lease),
     };
     match admit_initialization(exports, id, bound, &fallback) {
         Ok(InitAdmission::Start(previous)) => drop(previous),
@@ -456,6 +470,7 @@ where
         finished: false,
     };
     let mut source = None;
+    let mut received_data = None;
     let initialized = boundary::catch(call_context("run plugin initialization", Some(id)), || {
         // 安全前提（safety）。config 是宿主仍保活的原始同轮同步输入。
         let config = unsafe { ConfigInput::from_input(config) }?;
@@ -475,18 +490,47 @@ where
         // 安全前提（safety）。已由配置输入构造同轮连接，原终端仍由宿主同步保活。
         let terminal = unsafe { Terminal::from_input(config.connection(), terminal) }?;
         let runtime = take_runtime(config.connection(), runtime)?;
-        let config = config.take()?;
+        // SAFETY: 第四输入来自同一受保护调用，真实类型在消费前预核。
+        let data = unsafe { DataInput::<D>::from_input(config.connection(), data) }?;
         attempt.entered = true;
         *progress = INIT_NEEDS_CLOSE;
+        data.take_into(&mut received_data)?;
+        let config = config.take()?;
+        let data = received_data.take().ok_or_else(|| plugin_error(ErrorKind::Corrupted, "receive initialization data"))?;
         initialize(
             Inputs {
                 terminal,
                 config,
                 runtime,
+                data,
             },
             &mut attempt.state,
         )
     });
+
+    let data_cleanup = boundary::catch(call_context("dispose undelivered initialization data", Some(id)), || {
+        // 先置空再析构（Drop）；即使析构失败也不盲目重跑。
+        drop(received_data.take());
+        Ok(())
+    });
+    if let Err(error) = data_cleanup {
+        *progress = INIT_NEEDS_CLOSE;
+        {
+            let mut state = exports.state.lock();
+            if let Some(record) = state.current.as_mut().filter(|record| same_id(&record.id, id)) {
+                record.phase = PluginPhase::CleanupFailed;
+                record.close_failure = Some(Arc::clone(&fallback));
+            }
+        }
+        // 固定失败责任之后才采集详细诊断（diagnostic），其间展开仍保留原失败。
+        let (failure, _) = capture_close_report(error, id);
+        let previous = {
+            let mut state = exports.state.lock();
+            state.current.as_mut().filter(|record| same_id(&record.id, id))
+                .and_then(|record| record.close_failure.replace(failure))
+        };
+        drop(previous);
+    }
 
     let (failure, unconfirmed) = match initialized {
         Ok(()) => (None, false),
@@ -521,10 +565,14 @@ where
         } else {
             None
         };
-        if unconfirmed {
-            record.close_failure = failure.clone();
+        if matches!(record.phase, PluginPhase::CleanupFailed) {
+            *progress = INIT_NEEDS_CLOSE;
+        } else {
+            if unconfirmed {
+                record.close_failure = failure.clone();
+            }
+            record.phase = phase;
         }
-        record.phase = phase;
         (
             std::mem::replace(&mut record.init_failure, failure.clone()),
             detached,
