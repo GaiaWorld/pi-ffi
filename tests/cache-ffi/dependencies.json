@@ -1,0 +1,21 @@
+{
+  "archive_sha256": "b651137016cd7ce0ed88f18df8b2466cb9ad9582fbad270e2179ab495e373508",
+  "vendor_archive_sha256": "01672517be13a86b3f2ee1a6d01d7bc7661c0faecdd3bc4a0e8e488171d2f6f4",
+  "cache_service": {
+    "version": "0.2.3",
+    "revision": "31a9a8f532c6ef0b37bd298a5190c8046eda67c8"
+  },
+  "cache_client": {
+    "version": "0.2.3",
+    "revision": "e81c37540ca641ed73dc3fb6728a7822e35b472a"
+  },
+  "p2p": "1.3.22",
+  "p2p_source": {
+    "revision": "dd90c86f84b6fc537f2d8e571ca60a05a8c2b910",
+    "archive_sha256": "dcbf460b49934f9e877ed205aae2c01c1bfc4256ef8987419e2f409468816c91",
+    "tree_sha256": "951a369e7f59294c6ef6cc0248aa483bab5e8cf772a3c49c2e2a9d0877cb76a9"
+  },
+  "p2p_service": "0.3.11",
+  "service": "0.6.3",
+  "original_libraries_modified": false
+}

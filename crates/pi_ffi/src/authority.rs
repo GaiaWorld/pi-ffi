@@ -5,7 +5,7 @@ mod inner;
 
 use crate::{
     loader::{
-        Entrypoints, MappedIdentity, NativeModule, VerifiedDeployment, VerifiedFiles, VerifiedImage,
+        Entrypoints, InitializationEntry, InitializationVersion, MappedIdentity, NativeModule, VerifiedDeployment, VerifiedFiles, VerifiedImage,
     },
     package::{HostBuild, Metadata},
 };
@@ -112,6 +112,8 @@ enum ModulePhase {
 
 struct RoundRecord {
     id: InitIdV1,
+    // 只由准备方法选择，与实际输入变体一致；后续不得换版。
+    version: InitializationVersion,
     // 本轮已发出的操作号（operation identifier）。实际动作仍由其原记录保存。
     issued_operations: Vec<OperationIdV1>,
     phase: RoundPhase,
@@ -276,12 +278,21 @@ enum SystemPhase {
     Finished,
 }
 
-pub(crate) struct PreparedInputs {
-    pub(crate) config: PublishedConfig,
-    pub(crate) terminal: PublishedTerminal,
-    pub(crate) runtime: Option<PublishedRuntime>,
-    // 初始化数据（initialization data）的本轮原始持有（holding），沿来源归还路径保管。
-    pub(crate) data: pi_ffi_adapters::data::PublishedData,
+// 本轮原持有（holding）按版本保存；V1 不创建虚假的第四输入。
+pub(crate) enum PreparedInputs {
+    #[cfg(feature = "init_v1")]
+    V1 {
+        config: PublishedConfig,
+        terminal: PublishedTerminal,
+        runtime: Option<PublishedRuntime>,
+    },
+    #[cfg(feature = "init_v2")]
+    V2 {
+        config: PublishedConfig,
+        terminal: PublishedTerminal,
+        runtime: Option<PublishedRuntime>,
+        data: pi_ffi_adapters::data::PublishedData,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -306,6 +317,8 @@ pub(crate) struct RoundCall {
     id: InitIdV1,
     finished: bool,
     pub(crate) entries: Entrypoints,
+    // 随本轮调用资格复制的准确入口，关闭仍使用原 entries.close。
+    pub(crate) initialize: InitializationEntry,
     pub(crate) image: Arc<VerifiedImage>,
     pub(crate) connection: Connection,
     pub(crate) inputs: Option<Arc<PreparedInputs>>,
@@ -412,14 +425,15 @@ impl Authority {
         inner::authority_record_mapping(self, epoch, mapped)
     }
 
-    // 按本轮是否提供运行时（runtime）核对配套库，通过才登记本轮。
+    // 先核指定版本真实入口及配套库，再预留；缺入口 Unsupported，不发布输入。
     // @trace 6
     pub(crate) fn reserve_round(
         &'static self,
         epoch: u64,
+        version: InitializationVersion,
         has_runtime: bool,
     ) -> Result<(InitIdV1, Connection)> {
-        inner::authority_reserve_round(self, epoch, has_runtime)
+        inner::authority_reserve_round(self, epoch, version, has_runtime)
     }
 
     // @trace 7

@@ -31,8 +31,8 @@ InvalidState。此检查不解引用登记的地址，通过后才按字段重�
 重建值仍借用同一原持有。连接有自己的 B1 独立持有；用于取用的接口持有仅在
 ConfigInput 存活时保留。构造失败由已有的责任记录处理实际已取得的持有。
 B5 在 take 前核对终端及已提供的运行时属于本轮，并取得相应 Rust 输入。
-这些输入的核对不消费配置（Config）。初始化数据（initialization data）D 的预核与
-取用由上层先完成，随后才取配置（Config）。配置收到与否及内容是否合适是两个问题，空配置可以交接。
+这些输入的核对不消费配置（Config）。初始化 v2 的数据（initialization data）D 预核与
+取用由上层先完成，随后才取配置（Config）；v1 没有 D，在其它输入预核后直接取配置。配置收到与否及内容是否合适是两个问题，空配置可以交接。
 
 取用。ConfigInput 借用真实输入，限当前调用和线程。take 消费壳，经 Interface
 取得代码保护，来源先核同一借用地址仍在最内层，再用 Registry::with_access 对
@@ -206,8 +206,8 @@ impl<'call> ConfigInput<'call> {
         inner::connection(self)
     }
 
-    /// 在终端（terminal）、已提供的运行时（runtime）及数据（data）预核后，
-    /// 由上层先接收数据（data），再取出这一轮的配置（Config）。
+    /// 完成所选初始化版本的终端（terminal）及已提供运行时（runtime）预核后取配置。
+    /// v1 没有数据 D；v2 还须预核并先接收数据（data），再调用本方法。
     ///
     /// 成功后由插件（plugin）持有原生配置。取出后若保护归还失败，则报告
     /// `pi_result`，接收侧清理该份配置，该轮继续按已发生的取用处理。

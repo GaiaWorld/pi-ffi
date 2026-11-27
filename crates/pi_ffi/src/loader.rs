@@ -4,7 +4,11 @@
 mod inner;
 
 use crate::package::{BuildManifest, HostBuild, Metadata, PluginPackage, UnloadPolicy};
-use pi_ffi_abi::management::{CloseFnV1, InitializeFnV2, MetadataFnV1, MetadataV1};
+use pi_ffi_abi::management::{CloseFnV1, MetadataFnV1, MetadataV1};
+#[cfg(feature = "init_v1")]
+use pi_ffi_abi::management::InitializeFnV1;
+#[cfg(feature = "init_v2")]
+use pi_ffi_abi::management::InitializeFnV2;
 use pi_result::Result;
 use std::{fs::File, mem::ManuallyDrop, path::PathBuf, sync::Arc};
 
@@ -56,11 +60,38 @@ pub(crate) struct MappedIdentity {
     address: usize,
 }
 
+/// 准备时固定的初始化规范版本（initialization version）。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InitializationVersion {
+    #[cfg(feature = "init_v1")]
+    V1,
+    #[cfg(feature = "init_v2")]
+    V2,
+}
+
+/// 全部允许且已核真实归属的初始化入口（initialization entrypoints）。
+#[derive(Clone, Copy)]
+pub(crate) struct InitializationEntrypoints {
+    #[cfg(feature = "init_v1")]
+    pub(crate) v1: Option<InitializeFnV1>,
+    #[cfg(feature = "init_v2")]
+    pub(crate) v2: Option<InitializeFnV2>,
+}
+
+/// 原轮准确函数指针（function pointer）；不同签名不允许互转。
+#[derive(Clone, Copy)]
+pub(crate) enum InitializationEntry {
+    #[cfg(feature = "init_v1")]
+    V1(InitializeFnV1),
+    #[cfg(feature = "init_v2")]
+    V2(InitializeFnV2),
+}
+
 /// 受进程记录保护时才能调用的同一模块入口。
 #[derive(Clone, Copy)]
 pub(crate) struct Entrypoints {
     pub(crate) metadata: MetadataFnV1,
-    pub(crate) initialize: InitializeFnV2,
+    pub(crate) initialize: InitializationEntrypoints,
     pub(crate) close: CloseFnV1,
 }
 
@@ -103,7 +134,14 @@ dlsym 地址经 dladdr1 比对归属。校验区间基于所持模块的可读�
 归属。局部将 libloading 的 isize 句柄按同一位值交给 windows-sys 的 HMODULE。
 用 VirtualQuery 核元信息可读区间。被借用的地址不脱离模块保护。
 
-装入前核读原文件、摘要、实际 ELF／PE x86_64 DLL／共享对象、三个直接导出及
+共享适配库（shared adapter library）的地址依据由 pi_ffi_adapters::library_address 返回其私有只读
+静态对象（static object）的地址（address）。查返回的数据地址，不查查询函数（function）或
+ConfigInput::take 的代码地址，避免导入跳板（import thunk）改变归属判断。
+随后继续按原核准文件身份及实际映射（mapping）身份严格比对，不解引用该对象、不新增
+系统引用，不因查询或比对失败换用旧取址方式。实际平台适用性以对应构建及验证结果为准，
+不由这段设计说明推定Windows原生验证已经通过。
+
+装入前核读原文件、摘要、实际 ELF／PE x86_64 DLL／共享对象、三类标准管理接口的直接导出及
 依赖。构建及部署前提覆盖平台运行的构造器和 inventory 私有表。配套 Rust 核验
 使用宿主构建记录及实际可见的相同依赖制品。程序映射表不替代导入绑定证明。
 系统装入成功后经 libloading 的 into_raw/from_raw 无失败移回唯一引用，随引用
@@ -209,4 +247,12 @@ impl VerifiedImage {
 // @trace 8
 pub(crate) fn mapped_identity(module: &NativeModule) -> Result<MappedIdentity> {
     inner::mapped_identity(module)
+}
+
+impl InitializationEntrypoints {
+    // 原轮精确选择；缺失不得换版或开始发布输入（inputs）。
+    // @trace 18
+    pub(crate) fn select(&self, version: InitializationVersion) -> Result<InitializationEntry> {
+        inner::select_initialization(self, version)
+    }
 }

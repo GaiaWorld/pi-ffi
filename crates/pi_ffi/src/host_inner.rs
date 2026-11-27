@@ -1,15 +1,16 @@
 use super::*;
 use crate::{
     authority::{FfiProgress, LoadAdmission, Operation, PreparedInputs, RoundAdmission, RoundCall},
-    loader,
+    loader::{self, InitializationVersion, InitializationEntry},
 };
 use pi_ffi_abi::{
     management::{MetadataV1, INIT_COMPLETED, INIT_NEEDS_CLOSE, INIT_NOT_STARTED},
-    ObjectRefV1,
 };
 use pi_ffi_adapters::{
-    config::PublishedConfig, data::PublishedData, runtime::PublishedRuntime, service::PublishedTerminal,
+    config::PublishedConfig, runtime::PublishedRuntime, service::PublishedTerminal,
 };
+#[cfg(feature = "init_v2")]
+use pi_ffi_adapters::data::PublishedData;
 use pi_ffi_core::{boundary, control::Connection, diagnostic};
 use pi_result::{attachment::Operation as ErrorOperation, Error, ErrorKind};
 use std::mem::MaybeUninit;
@@ -154,6 +155,7 @@ pub(super) fn plugin_metadata(plugin: &Plugin) -> &Metadata {
     &plugin.metadata
 }
 
+#[cfg(feature = "init_v2")]
 pub(super) fn plugin_prepare<T, R, D>(
     plugin: &Plugin,
     terminal: TerminalInput<T>,
@@ -166,29 +168,37 @@ where
     R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
     D: Send + Sync + 'static,
 {
-    prepare_plugin(plugin, terminal, config, data, runtime.is_some(), |connection| {
-        runtime
-            .map(|runtime| PublishedRuntime::publish(connection, runtime))
-            .transpose()
+    prepare_plugin(plugin, InitializationVersion::V2, runtime.is_some(), |connection| {
+        // SAFETY: 准入已核同轮和配套构建（matching build），原值在本次保护内交接。
+        let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
+        let terminal = unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
+        let data = unsafe { PublishedData::publish(connection.clone(), data) }?;
+        let runtime = runtime.map(|runtime| PublishedRuntime::publish(connection, runtime)).transpose()?;
+        Ok(PreparedInputs::V2 { config, terminal, runtime, data })
     })
 }
 
+#[cfg(feature = "init_v2")]
 pub(super) fn plugin_prepare_without_runtime<T: Send + Sync + 'static, D: Send + Sync + 'static>(
     plugin: &Plugin,
     terminal: TerminalInput<T>,
     config: Config,
     data: D,
 ) -> Result<Initialization> {
-    prepare_plugin(plugin, terminal, config, data, false, |_| Ok(None))
+    prepare_plugin(plugin, InitializationVersion::V2, false, |connection| {
+        // SAFETY: 准入已核同轮和配套构建（matching build），原值在本次保护内交接。
+        let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
+        let terminal = unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
+        let data = unsafe { PublishedData::publish(connection, data) }?;
+        Ok(PreparedInputs::V2 { config, terminal, runtime: None, data })
+    })
 }
 
-fn prepare_plugin<T: Send + Sync + 'static, D: Send + Sync + 'static>(
+fn prepare_plugin(
     plugin: &Plugin,
-    terminal: TerminalInput<T>,
-    config: Config,
-    data: D,
+    version: InitializationVersion,
     has_runtime: bool,
-    publish_runtime: impl FnOnce(Connection) -> Result<Option<PublishedRuntime>>,
+    publish: impl FnOnce(Connection) -> Result<PreparedInputs>,
 ) -> Result<Initialization> {
     let authority = plugin.authority;
     let mut reserved = None;
@@ -201,26 +211,10 @@ fn prepare_plugin<T: Send + Sync + 'static, D: Send + Sync + 'static>(
         },
         || {
             // 原值的接管及准备失败时的析构（Drop）均位于同一保护边界内。
-            let (id, connection) = authority.reserve_round(plugin.epoch, has_runtime)?;
+            let (id, connection) = authority.reserve_round(plugin.epoch, version, has_runtime)?;
             reserved = Some(InitIdV1 { module_epoch: id.module_epoch, round: id.round });
-            // 安全前提（safety）。同轮连接及实际配套已核对，原生输入由其配套代码持有。
-            let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
-            let terminal =
-                unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
-            let data = unsafe { PublishedData::publish(connection.clone(), data) }?;
-            let runtime = publish_runtime(connection)?;
-            authority.publish_inputs(
-                InitIdV1 {
-                    module_epoch: id.module_epoch,
-                    round: id.round,
-                },
-                PreparedInputs {
-                    config,
-                    terminal,
-                    runtime,
-                    data,
-                },
-            )
+            let inputs = publish(connection)?;
+            authority.publish_inputs(id, inputs)
         },
     );
     match (prepared, reserved) {
@@ -347,50 +341,46 @@ fn initialize_with_inputs(authority: &Authority, call: &RoundCall) -> Result<()>
         .inputs
         .as_ref()
         .ok_or_else(|| Error::new(ErrorKind::Corrupted))?;
-    loader::check_inputs(&call.image, inputs.runtime.is_some())?;
-    inputs.config.with_input(|config| {
-        inputs.data.with_input(|data| inputs
-            .terminal
-            .with_input(|terminal| match &inputs.runtime {
-                Some(runtime) => runtime.with_input(|runtime| {
-                    invoke_initialization(
-                        authority,
-                        call,
-                        std::ptr::from_ref(runtime),
-                        terminal,
-                        config,
-                        data,
-                    )
-                }),
-                None => invoke_initialization(authority, call, std::ptr::null(), terminal, config, data),
+    match (inputs.as_ref(), call.initialize) {
+        #[cfg(feature = "init_v1")]
+        (PreparedInputs::V1 { config, terminal, runtime }, InitializationEntry::V1(entry)) => {
+            loader::check_inputs(&call.image, runtime.is_some())?;
+            config.with_input(|config| terminal.with_input(|terminal| {
+                let invoke = |runtime| {
+                    authority.remember_progress(call, FfiProgress::OutcomeUnknown);
+                    // SAFETY: 三项原始输入受同一轮实际调用保护，entry 是准确的 v1 函数。
+                    finish_initialization_reply(authority, call, unsafe { entry(runtime, terminal, config) })
+                };
+                match runtime { Some(runtime) => runtime.with_input(|runtime| invoke(std::ptr::from_ref(runtime))), None => invoke(std::ptr::null()) }
             }))
-    })
+        }
+        #[cfg(feature = "init_v2")]
+        (PreparedInputs::V2 { config, terminal, runtime, data }, InitializationEntry::V2(entry)) => {
+            loader::check_inputs(&call.image, runtime.is_some())?;
+            config.with_input(|config| data.with_input(|data| terminal.with_input(|terminal| {
+                let invoke = |runtime| {
+                    authority.remember_progress(call, FfiProgress::OutcomeUnknown);
+                    // SAFETY: 四项原始输入受同一轮实际调用保护，entry 是准确的 v2 函数。
+                    finish_initialization_reply(authority, call, unsafe { entry(runtime, terminal, config, data) })
+                };
+                match runtime { Some(runtime) => runtime.with_input(|runtime| invoke(std::ptr::from_ref(runtime))), None => invoke(std::ptr::null()) }
+            })))
+        }
+        #[cfg(all(feature = "init_v1", feature = "init_v2"))]
+        _ => Err(Error::new(ErrorKind::Corrupted).attach(ErrorOperation("match initialization input version"))),
+    }
 }
 
-fn invoke_initialization(
-    authority: &Authority,
-    call: &RoundCall,
-    runtime: *const ObjectRefV1,
-    terminal: &ObjectRefV1,
-    config: &ObjectRefV1,
-    data: &ObjectRefV1,
-) -> Result<()> {
-    authority.remember_progress(call, FfiProgress::OutcomeUnknown);
-    // 安全前提（safety）。标准调用资格保活实际模块，所有原生输入处在嵌套同步借用中。
-    let reply = unsafe { (call.entries.initialize)(runtime, terminal, config, data) };
+fn finish_initialization_reply(authority: &Authority, call: &RoundCall, reply: pi_ffi_abi::management::InitReplyV1) -> Result<()> {
     let progress = match reply.progress {
         INIT_COMPLETED => FfiProgress::InitializationCompleted,
         INIT_NOT_STARTED if reply.outcome.kind != 0 => FfiProgress::InitializationNotStarted,
         INIT_NEEDS_CLOSE if reply.outcome.kind != 0 => FfiProgress::InitializationNeedsClose,
-        _ => {
-            return Err(Error::new(ErrorKind::Corrupted)
-                .attach(ErrorOperation("read initialization progress"))
-                .attach(reply.progress))
-        }
+        _ => return Err(Error::new(ErrorKind::Corrupted).attach(ErrorOperation("read initialization progress")).attach(reply.progress)),
     };
     authority.remember_progress(call, progress);
     authority.validate_diagnostic(call, &reply.outcome)?;
-    // 安全前提（safety）。独立诊断已经核对本模块、来源和本轮持有，所有借用仍有效。
+    // SAFETY: 原版本调用及全部输入仍受保护，诊断（diagnostic）已核对本轮来源。
     unsafe { diagnostic::decode_management(Some(&call.connection), reply.outcome) }
 }
 
@@ -419,4 +409,41 @@ fn finish_returning_inputs(initialization: &Initialization) -> Result<()> {
         RoundAdmission::Call(_) => Err(Error::new(ErrorKind::Corrupted)
             .attach(ErrorOperation("repeat completed plugin close"))),
     }
+}
+
+
+#[cfg(feature = "init_v1")]
+pub(super) fn plugin_prepare_v1<T, R>(
+    plugin: &Plugin,
+    terminal: TerminalInput<T>,
+    config: Config,
+    runtime: Option<Arc<R>>,
+) -> Result<Initialization>
+where
+    T: Send + Sync + 'static,
+    R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+{
+    prepare_plugin(plugin, InitializationVersion::V1, runtime.is_some(), |connection| {
+        // SAFETY: 准入已核同轮和配套构建，接管的原始输入在当前保护内。
+        // SAFETY: 准入已核同轮和配套构建（matching build），原值在本次保护内交接。
+        let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
+        let terminal = unsafe { PublishedTerminal::publish(connection.clone(), terminal.terminal) }?;
+        let runtime = runtime.map(|runtime| PublishedRuntime::publish(connection, runtime)).transpose()?;
+        Ok(PreparedInputs::V1 { config, terminal, runtime })
+    })
+}
+
+#[cfg(feature = "init_v1")]
+pub(super) fn plugin_prepare_v1_without_runtime<T: Send + Sync + 'static>(
+    plugin: &Plugin,
+    terminal: TerminalInput<T>,
+    config: Config,
+) -> Result<Initialization> {
+    prepare_plugin(plugin, InitializationVersion::V1, false, |connection| {
+        // SAFETY: 本轮配套环境及真实终端（terminal）由准备准入保证。
+        // SAFETY: 准入已核同轮和配套构建（matching build），原值在本次保护内交接。
+        let config = unsafe { PublishedConfig::publish(connection.clone(), config) }?;
+        let terminal = unsafe { PublishedTerminal::publish(connection, terminal.terminal) }?;
+        Ok(PreparedInputs::V1 { config, terminal, runtime: None })
+    })
 }

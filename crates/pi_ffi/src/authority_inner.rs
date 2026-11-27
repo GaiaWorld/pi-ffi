@@ -114,6 +114,7 @@ pub(super) fn authority_reserve_load(
 pub(super) fn authority_reserve_round(
     authority: &'static Authority,
     epoch: u64,
+    version: InitializationVersion,
     has_runtime: bool,
 ) -> Result<(InitIdV1, Connection)> {
     let image = {
@@ -126,11 +127,12 @@ pub(super) fn authority_reserve_round(
     .map_err(|(kind, failure)| {
         module_error(kind, "check initialization input libraries", failure)
     })?;
+    image.entries.initialize.select(version)?;
     loader::check_inputs(&image, has_runtime)?;
 
     let id = {
         let mut state = authority.state.lock();
-        reserve_round_record(&mut state, epoch, &image)
+        reserve_round_record(&mut state, epoch, &image, version)
     }
     .map_err(|(kind, failure)| module_error(kind, "reserve plugin initialization", failure))?;
 
@@ -180,6 +182,12 @@ pub(super) fn authority_publish_inputs(
     id: InitIdV1,
     inputs: PreparedInputs,
 ) -> Result<()> {
+    let version = match &inputs {
+        #[cfg(feature = "init_v1")]
+        PreparedInputs::V1 { .. } => InitializationVersion::V1,
+        #[cfg(feature = "init_v2")]
+        PreparedInputs::V2 { .. } => InitializationVersion::V2,
+    };
     let inputs = Arc::new(inputs);
     let published = {
         let mut state = authority.state.lock();
@@ -191,6 +199,7 @@ pub(super) fn authority_publish_inputs(
                 if !matches!(round.phase, RoundPhase::Preparing)
                     || round.connection.is_none()
                     || round.inputs.is_some()
+                    || round.version != version
                 {
                     return false;
                 }
@@ -1814,11 +1823,13 @@ fn reserve_round_record(
     state: &mut State,
     epoch: u64,
     checked: &Arc<VerifiedImage>,
+    version: InitializationVersion,
 ) -> std::result::Result<InitIdV1, ModuleFailure> {
     let (image, metadata) = ready_for_prepare(state, epoch)?;
     if !Arc::ptr_eq(image, checked) {
         return Err((ErrorKind::InvalidState, None));
     }
+    image.entries.initialize.select(version).map_err(|error| (*error.current_context(), Some(Arc::new(error))))?;
     check_quarantined_version(state, metadata)?;
     let occupied = state
         .rounds
@@ -1845,6 +1856,7 @@ fn reserve_round_record(
     };
     state.rounds.push(RoundRecord {
         id: round_id(&id),
+        version,
         issued_operations: Vec::new(),
         phase: RoundPhase::Preparing,
         inputs: None,
@@ -2349,6 +2361,7 @@ fn begin_round_call(
     }
     let image = Arc::clone(image);
     let round = &state.rounds[index];
+    let initialize = image.entries.initialize.select(round.version).map_err(|error| (*error.current_context(), Some(Arc::new(error))))?;
     let connection = round
         .connection
         .clone()
@@ -2390,6 +2403,7 @@ fn begin_round_call(
             id: round_id(id),
             finished: false,
             entries: image.entries,
+            initialize,
             image,
             connection,
             inputs,
@@ -3732,6 +3746,20 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
 }
 "#;
 
+    fn fixture_version() -> InitializationVersion {
+        #[cfg(feature = "init_v2")]
+        { InitializationVersion::V2 }
+        #[cfg(all(feature = "init_v1", not(feature = "init_v2")))]
+        { InitializationVersion::V1 }
+    }
+
+    fn fixture_source() -> String {
+        if cfg!(feature = "init_v2") { FIXTURE.into() } else {
+            FIXTURE.replacen("pi_ffi_initialize_v2", "pi_ffi_initialize_v1", 1)
+                .replacen("    _: *const ObjectRefV1,\n) -> InitReplyV1", ") -> InitReplyV1", 1)
+        }
+    }
+
     /// 本测试进程内唯一临时目录（temporary directory），析构时清理创建的文件。
     struct TestDirectory(PathBuf);
 
@@ -3763,7 +3791,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
     /// 使用仓库的共同应用二进制接口（ABI），只编译当前单元用例的装入输入。
     fn fixture_binary() -> &'static [u8] {
         static BINARY: OnceLock<Vec<u8>> = OnceLock::new();
-        BINARY.get_or_init(|| compile_fixture(FIXTURE))
+        BINARY.get_or_init(|| compile_fixture(&fixture_source()))
     }
 
     /// 将本模块提供的可信源码（source code）编译为独立动态库（dynamic library）字节。
@@ -4437,7 +4465,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         const OCCUPIED: &str = "1.2.3+occupied";
         const INDEPENDENT: &str = "1.2.3+independent";
         let manager = Manager::process(build()).unwrap();
-        let native = compile_fixture(&FIXTURE.replace(VERSION, OCCUPIED));
+        let native = compile_fixture(&fixture_source().replace(VERSION, OCCUPIED));
         let artifact = Artifact::from_binary(&native, OCCUPIED);
         let package = artifact.package(ACTUAL_UUID);
         let actual_request = request(ACTUAL_UUID);
@@ -4446,7 +4474,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         let prepared = {
             let mut state = AUTHORITY.state.lock();
             let image = Arc::clone(ready_for_prepare(&state, epoch).unwrap().0);
-            let prepared = reserve_round_record(&mut state, epoch, &image).unwrap();
+            let prepared = reserve_round_record(&mut state, epoch, &image, fixture_version()).unwrap();
             // 只给首次派发（first dispatch）的准入分支建立已准备状态。
             state
                 .rounds
@@ -4465,7 +4493,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
             .unwrap();
         assert_eq!(*failure.current_context(), ErrorKind::Conflict);
         assert!(rejected.mapped());
-        let preparing = AUTHORITY.reserve_round(epoch, false).err().unwrap();
+        let preparing = AUTHORITY.reserve_round(epoch, fixture_version(), false).err().unwrap();
         let starting = AUTHORITY
             .begin_round(round_id(&prepared), Operation::Initialize)
             .err()
@@ -4501,7 +4529,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         AUTHORITY.maintain(Some(prepared), 1).unwrap();
         plugin.unload().unwrap();
 
-        let independent = compile_fixture(&FIXTURE.replace(VERSION, INDEPENDENT));
+        let independent = compile_fixture(&fixture_source().replace(VERSION, INDEPENDENT));
         let other = Artifact::from_binary(&independent, INDEPENDENT);
         let other_package = other.package(ACTUAL_UUID);
         let other_plugin = manager.load(&other_package, &actual_request).unwrap();
@@ -4509,7 +4537,7 @@ extern "C" fn pi_ffi_close_v1(_: InitIdV1) -> OutcomeV1 {
         let other_round = {
             let mut state = AUTHORITY.state.lock();
             let image = Arc::clone(ready_for_prepare(&state, other_epoch).unwrap().0);
-            reserve_round_record(&mut state, other_epoch, &image).unwrap()
+            reserve_round_record(&mut state, other_epoch, &image, fixture_version()).unwrap()
         };
         let cancelled =
             AUTHORITY.fail_prepare(round_id(&other_round), Error::new(ErrorKind::InvalidInput));

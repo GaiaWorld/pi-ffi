@@ -1,6 +1,8 @@
 use super::*;
 use pi_ffi_abi::management::{INIT_COMPLETED, INIT_NEEDS_CLOSE, INIT_NOT_STARTED};
-use pi_ffi_adapters::{config::ConfigInput, data::DataInput};
+use pi_ffi_adapters::config::ConfigInput;
+#[cfg(feature = "init_v2")]
+use pi_ffi_adapters::data::DataInput;
 use pi_ffi_core::{
     boundary::{self, Context},
     control::Connection,
@@ -56,6 +58,7 @@ pub(super) unsafe fn export_metadata<S: Send + 'static>(
     )
 }
 
+#[cfg(feature = "init_v2")]
 pub(super) unsafe fn export_initialize<S, T, R, D>(
     exports: &Exports<S>,
     runtime: *const ObjectRefV1,
@@ -84,6 +87,7 @@ where
     )
 }
 
+#[cfg(feature = "init_v2")]
 pub(super) unsafe fn export_initialize_without_runtime<
     S: Send + 'static,
     T: Send + Sync + 'static,
@@ -169,14 +173,22 @@ fn same_lease(left: &LeaseV1, right: &LeaseV1) -> bool {
 }
 
 fn same_inputs(left: &BoundInputs, right: &BoundInputs) -> bool {
-    same_lease(&left.config, &right.config)
-        && same_lease(&left.terminal, &right.terminal)
-        && same_lease(&left.data, &right.data)
-        && match (&left.runtime, &right.runtime) {
-            (None, None) => true,
-            (Some(left), Some(right)) => same_lease(left, right),
-            _ => false,
-        }
+    match (left, right) {
+        #[cfg(feature = "init_v1")]
+        (BoundInputs::V1 { config: lc, terminal: lt, runtime: lr }, BoundInputs::V1 { config: rc, terminal: rt, runtime: rr }) => same_lease(lc, rc) && same_lease(lt, rt) && match (lr, rr) {
+                (None, None) => true,
+                (Some(left), Some(right)) => same_lease(left, right),
+                _ => false,
+            },
+        #[cfg(feature = "init_v2")]
+        (BoundInputs::V2 { config: lc, terminal: lt, runtime: lr, data: ld }, BoundInputs::V2 { config: rc, terminal: rt, runtime: rr, data: rd }) => same_lease(ld, rd) && (same_lease(lc, rc) && same_lease(lt, rt) && match (lr, rr) {
+                (None, None) => true,
+                (Some(left), Some(right)) => same_lease(left, right),
+                _ => false,
+            }),
+        #[cfg(all(feature = "init_v1", feature = "init_v2"))]
+        _ => false,
+    }
 }
 
 unsafe fn protected_input<'call>(input: *const ObjectRefV1) -> Result<&'call ObjectRefV1> {
@@ -206,6 +218,7 @@ unsafe fn protected_input<'call>(input: *const ObjectRefV1) -> Result<&'call Obj
     Ok(input)
 }
 
+#[cfg(feature = "init_v2")]
 fn initialize_export<S, T, R, D>(
     exports: &Exports<S>,
     runtime: *const ObjectRefV1,
@@ -424,6 +437,7 @@ impl<S: Send + 'static> Drop for ExportAttempt<'_, S> {
     }
 }
 
+#[cfg(feature = "init_v2")]
 fn run_initialization<S, T, R, D>(
     exports: &Exports<S>,
     config: &ObjectRefV1,
@@ -444,7 +458,7 @@ where
         ErrorKind::Internal,
         "plugin initialization interrupted",
     )));
-    let bound = BoundInputs {
+    let bound = BoundInputs::V2 {
         config: copy_lease(&config.lease),
         terminal: copy_lease(&terminal.lease),
         runtime: runtime.map(|runtime| copy_lease(&runtime.lease)),
@@ -719,4 +733,332 @@ fn close_export<S: Send + 'static>(
     let outcome = publish_result(source.as_deref(), failure.as_deref());
     drop(old);
     outcome
+}
+
+
+#[cfg(feature = "init_v1")]
+pub(super) unsafe fn export_initialize_v1<S, T, R>(
+    exports: &Exports<S>,
+    runtime: *const ObjectRefV1,
+    terminal: *const ObjectRefV1,
+    config: *const ObjectRefV1,
+    initialize: impl FnOnce(InputsV1<T, R>, &mut Option<S>) -> Result<()>,
+) -> InitReplyV1
+where
+    S: Send + 'static,
+    T: Send + Sync + 'static,
+    R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+{
+    initialize_export_v1(exports, runtime, terminal, config, initialize, |connection, runtime| {
+        // SAFETY: 原输入由同一同步初始化（initialization）调用保护，连接已核同轮。
+        unsafe { Runtime::<R>::from_optional_input(connection, runtime) }
+    })
+}
+
+#[cfg(feature = "init_v1")]
+pub(super) unsafe fn export_initialize_v1_without_runtime<
+    S: Send + 'static,
+    T: Send + Sync + 'static,
+>(
+    exports: &Exports<S>,
+    runtime: *const ObjectRefV1,
+    terminal: *const ObjectRefV1,
+    config: *const ObjectRefV1,
+    initialize: impl FnOnce(InputsV1<T>, &mut Option<S>) -> Result<()>,
+) -> InitReplyV1 {
+    if !runtime.is_null() {
+        let outcome = diagnostic::protect_outcome(call_context("reject runtime for plugin export", None), move || {
+            drop(initialize);
+            limited(ErrorKind::InvalidInput)
+        });
+        return InitReplyV1 { progress: INIT_NOT_STARTED, outcome };
+    }
+    initialize_export_v1(exports, runtime, terminal, config, initialize, |_, _| Ok(None))
+}
+
+#[cfg(feature = "init_v1")]
+fn initialize_export_v1<S, T, R>(
+    exports: &Exports<S>,
+    runtime: *const ObjectRefV1,
+    terminal: *const ObjectRefV1,
+    config: *const ObjectRefV1,
+    initialize: impl FnOnce(InputsV1<T, R>, &mut Option<S>) -> Result<()>,
+    take_runtime: impl FnOnce(&Connection, Option<&ObjectRefV1>) -> Result<Option<Runtime<R>>>,
+) -> InitReplyV1
+where
+    S: Send + 'static,
+    T: Send + Sync + 'static,
+{
+    let mut progress = INIT_NOT_STARTED;
+    let outcome =
+        diagnostic::protect_outcome(call_context("initialize plugin export", None), || {
+            let inputs = (|| {
+                // 安全前提（safety）。这里只借用由遵约宿主明确保活的原始同步参数。
+                let config = unsafe { protected_input(config) }?;
+                let terminal = unsafe { protected_input(terminal) }?;
+                let runtime = if runtime.is_null() {
+                    None
+                } else {
+                    Some(unsafe { protected_input(runtime) }?)
+                };
+                let id = &config.lease.initialization;
+                if !same_id(id, &terminal.lease.initialization)
+                    || runtime.is_some_and(|runtime| !same_id(id, &runtime.lease.initialization))
+                {
+                    return Err(plugin_error(
+                        ErrorKind::Conflict,
+                        "match plugin input round",
+                    ));
+                }
+                Ok((config, terminal, runtime))
+            })();
+            let (config, terminal, runtime) = match inputs {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    return diagnostic::limited_outcome(
+                        *error.current_context(),
+                        ErrorKind::InvalidState,
+                    )
+                }
+            };
+            run_initialization_v1(
+                exports,
+                config,
+                terminal,
+                runtime,
+                initialize,
+                take_runtime,
+                &mut progress,
+            )
+        });
+    InitReplyV1 { progress, outcome }
+}
+
+#[cfg(feature = "init_v1")]
+fn run_initialization_v1<S, T, R>(
+    exports: &Exports<S>,
+    config: &ObjectRefV1,
+    terminal: &ObjectRefV1,
+    runtime: Option<&ObjectRefV1>,
+    initialize: impl FnOnce(InputsV1<T, R>, &mut Option<S>) -> Result<()>,
+    take_runtime: impl FnOnce(&Connection, Option<&ObjectRefV1>) -> Result<Option<Runtime<R>>>,
+    progress: &mut u32,
+) -> OutcomeV1
+where
+    S: Send + 'static,
+    T: Send + Sync + 'static,
+{
+    let id = &config.lease.initialization;
+    let fallback = Arc::new(ManagementFailure::capture(&plugin_error(
+        ErrorKind::Internal,
+        "plugin initialization interrupted",
+    )));
+    let bound = BoundInputs::V1 {
+        config: copy_lease(&config.lease),
+        terminal: copy_lease(&terminal.lease),
+        runtime: runtime.map(|runtime| copy_lease(&runtime.lease)),
+    };
+    match admit_initialization(exports, id, bound, &fallback) {
+        Ok(InitAdmission::Start(previous)) => drop(previous),
+        Ok(InitAdmission::Replay {
+            progress: known,
+            failure,
+            source,
+        }) => {
+            *progress = known;
+            return publish_result(source.as_deref(), failure.as_deref());
+        }
+        Err(kind) => return limited(kind),
+    }
+    let mut attempt = ExportAttempt {
+        exports,
+        id: copy_id(id),
+        state: None,
+        entered: false,
+        finished: false,
+    };
+    let mut source = None;
+    let initialized = boundary::catch(call_context("run plugin initialization", Some(id)), || {
+        // 安全前提（safety）。config 是宿主仍保活的原始同轮同步输入。
+        let config = unsafe { ConfigInput::from_input(config) }?;
+        let registry = Arc::new(Registry::attach(config.connection().clone())?);
+        {
+            let mut state = exports.state.lock();
+            let round = state
+                .current
+                .as_mut()
+                .filter(|round| same_id(&round.id, id))
+                .ok_or_else(|| {
+                    plugin_error(ErrorKind::Corrupted, "save plugin diagnostic source")
+                })?;
+            round.source = Some(Arc::clone(&registry));
+        }
+        source = Some(registry);
+        // 安全前提（safety）。已由配置输入构造同轮连接，原终端仍由宿主同步保活。
+        let terminal = unsafe { Terminal::from_input(config.connection(), terminal) }?;
+        let runtime = take_runtime(config.connection(), runtime)?;
+        attempt.entered = true;
+        *progress = INIT_NEEDS_CLOSE;
+        let config = config.take()?;
+        initialize(
+            InputsV1 {
+                terminal,
+                config,
+                runtime,
+            },
+            &mut attempt.state,
+        )
+    });
+
+    let (failure, unconfirmed) = match initialized {
+        Ok(()) => (None, false),
+        Err(error) => {
+            let (snapshot, unconfirmed) = capture_report(error, id);
+            (Some(snapshot), unconfirmed)
+        }
+    };
+    let phase = if unconfirmed {
+        *progress = INIT_NEEDS_CLOSE;
+        PluginPhase::CleanupFailed
+    } else if failure.is_none() {
+        *progress = INIT_COMPLETED;
+        PluginPhase::Initialized
+    } else if attempt.entered {
+        PluginPhase::NeedsClose
+    } else {
+        PluginPhase::Rejected
+    };
+    let old = {
+        let mut state = exports.state.lock();
+        let Some(record) = state
+            .current
+            .as_mut()
+            .filter(|round| same_id(&round.id, id))
+        else {
+            return limited(ErrorKind::Corrupted);
+        };
+        record.state = attempt.state.take();
+        let detached = if matches!(phase, PluginPhase::Rejected) {
+            record.source.take()
+        } else {
+            None
+        };
+        if matches!(record.phase, PluginPhase::CleanupFailed) {
+            *progress = INIT_NEEDS_CLOSE;
+        } else {
+            if unconfirmed {
+                record.close_failure = failure.clone();
+            }
+            record.phase = phase;
+        }
+        (
+            std::mem::replace(&mut record.init_failure, failure.clone()),
+            detached,
+        )
+    };
+    attempt.finished = true;
+    let outcome = publish_result(source.as_deref(), failure.as_deref());
+    drop(old);
+    outcome
+}
+
+#[cfg(all(test, feature = "init_v1", feature = "init_v2"))]
+mod compatibility_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // 仅向真实准入函数提供已解析绑定（binding），不构造或调用虚假的终端输入。
+    fn lease(slot: u64, round: u64) -> LeaseV1 {
+        LeaseV1 {
+            object: pi_ffi_abi::ObjectKeyV1 { source: 1, slot, generation: 1 },
+            initialization: InitIdV1 { module_epoch: 7, round },
+            holding: slot,
+        }
+    }
+
+    fn bound(round: u64, v2: bool) -> BoundInputs {
+        if v2 {
+            BoundInputs::V2 { config: lease(1, round), terminal: lease(2, round), runtime: None, data: lease(3, round) }
+        } else {
+            BoundInputs::V1 { config: lease(1, round), terminal: lease(2, round), runtime: None }
+        }
+    }
+
+    /// 同一轮次（round）的准确版本及完整租约只接纳一次，关闭结果稳定重放。
+    #[test]
+    fn compatibility_shares_admission_replay_busy_conflict_and_close() {
+        let exports = Exports::<()>::new(Declaration { uuid: [1; 16], version: "1.0.0" });
+        let id = InitIdV1 { module_epoch: 7, round: 1 };
+        let fallback = Arc::new(ManagementFailure::capture(&plugin_error(ErrorKind::Internal, "test interrupted initialization")));
+        assert!(matches!(admit_initialization(&exports, &id, bound(1, false), &fallback), Ok(InitAdmission::Start(None))));
+        assert_eq!(admit_initialization(&exports, &id, bound(1, false), &fallback).err(), Some(ErrorKind::Busy));
+        assert_eq!(admit_initialization(&exports, &id, bound(1, true), &fallback).err(), Some(ErrorKind::Conflict));
+        let mut changed = bound(1, false);
+        if let BoundInputs::V1 { terminal, .. } = &mut changed { terminal.holding += 1; }
+        assert_eq!(admit_initialization(&exports, &id, changed, &fallback).err(), Some(ErrorKind::Conflict));
+        {
+            let mut state = exports.state.lock();
+            let current = state.current.as_mut().unwrap();
+            current.phase = PluginPhase::Initialized;
+            current.init_failure = None;
+        }
+        assert!(matches!(admit_initialization(&exports, &id, bound(1, false), &fallback), Ok(InitAdmission::Replay { progress: INIT_COMPLETED, failure: None, .. })));
+        let calls = Cell::new(0);
+        assert_eq!(close_export(&exports, &id, |_| { calls.set(calls.get() + 1); Ok(()) }).kind, 0);
+        assert_eq!(close_export(&exports, &id, |_| { calls.set(calls.get() + 1); Ok(()) }).kind, 0);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(admit_initialization(&exports, &id, bound(1, false), &fallback).err(), Some(ErrorKind::InvalidState));
+        assert_eq!(admit_initialization(&exports, &id, bound(1, true), &fallback).err(), Some(ErrorKind::Conflict));
+        let next = InitIdV1 { module_epoch: 7, round: 2 };
+        assert!(matches!(admit_initialization(&exports, &next, bound(2, true), &fallback), Ok(InitAdmission::Start(Some(_)))));
+        assert_eq!(admit_initialization(&exports, &id, bound(1, false), &fallback).err(), Some(ErrorKind::InvalidState));
+    }
+
+    /// 首次可能消费后仍处于初始化（initialization）阶段；中断沿原清理责任收口。
+    #[test]
+    fn compatibility_entered_attempt_keeps_initializing_and_cleanup_failure() {
+        let exports = Exports::<()>::new(Declaration { uuid: [1; 16], version: "1.0.0" });
+        let id = InitIdV1 { module_epoch: 7, round: 20 };
+        let fallback = Arc::new(ManagementFailure::capture(&plugin_error(ErrorKind::Internal, "test entered attempt")));
+        assert!(matches!(admit_initialization(&exports, &id, bound(20, false), &fallback), Ok(InitAdmission::Start(_))));
+        let attempt = ExportAttempt { exports: &exports, id: copy_id(&id), state: None, entered: true, finished: false };
+        let called = Cell::new(false);
+        let reply = close_export(&exports, &id, |_| { called.set(true); Ok(()) });
+        assert_eq!(reply.kind, diagnostic::status_code(ErrorKind::Busy));
+        assert!(!called.get());
+        assert!(matches!(exports.state.lock().current.as_ref().unwrap().phase, PluginPhase::Initializing));
+        drop(attempt);
+        assert!(matches!(exports.state.lock().current.as_ref().unwrap().phase, PluginPhase::NeedsClose));
+        {
+            let mut state = exports.state.lock();
+            let current = state.current.as_mut().unwrap();
+            current.phase = PluginPhase::CleanupFailed;
+            current.close_failure = Some(fallback.clone());
+        }
+        drop(ExportAttempt { exports: &exports, id: copy_id(&id), state: None, entered: true, finished: false });
+        assert!(matches!(exports.state.lock().current.as_ref().unwrap().phase, PluginPhase::CleanupFailed));
+        let reply = close_export(&exports, &id, |_| { called.set(true); Ok(()) });
+        assert_ne!(reply.kind, 0);
+        assert!(!called.get());
+    }
+
+    /// 失败清理（cleanup）或在途关闭不能靠新版本、新标识绕过。
+    #[test]
+    fn compatibility_new_round_obeys_original_cleanup_gates() {
+        for phase in [PluginPhase::NeedsClose, PluginPhase::Closing, PluginPhase::CleanupFailed] {
+            let exports = Exports::<()>::new(Declaration { uuid: [1; 16], version: "1.0.0" });
+            let id = InitIdV1 { module_epoch: 7, round: 10 };
+            let fallback = Arc::new(ManagementFailure::capture(&plugin_error(ErrorKind::Internal, "test cleanup failure")));
+            assert!(matches!(admit_initialization(&exports, &id, bound(10, true), &fallback), Ok(InitAdmission::Start(_))));
+            {
+                let mut state = exports.state.lock();
+                let current = state.current.as_mut().unwrap();
+                current.phase = phase;
+                current.close_failure = Some(fallback.clone());
+            }
+            let next = InitIdV1 { module_epoch: 7, round: 11 };
+            assert_eq!(admit_initialization(&exports, &next, bound(11, false), &fallback).err(), Some(ErrorKind::Busy));
+            assert_eq!(admit_initialization(&exports, &id, bound(10, false), &fallback).err(), Some(ErrorKind::Conflict));
+        }
+    }
 }

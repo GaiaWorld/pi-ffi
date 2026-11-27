@@ -114,16 +114,48 @@ impl Manager {
 }
 
 impl Plugin {
+
+    /// 按初始化 v1 准备本轮，不接收初始化数据（initialization data）D。
+    /// 只有启用 init_v1 才可调用；插件没有对应入口时，在预留／发布前返回 Unsupported。
+    /// 同轮固定版本，不自动改用 v2；输入移入后失败不承诺退回原值。
+    #[cfg(feature = "init_v1")]
+    // @trace 15
+    pub fn prepare_v1<T, R>(
+        &self,
+        terminal: TerminalInput<T>,
+        config: Config,
+        runtime: Option<Arc<R>>,
+    ) -> Result<Initialization>
+    where
+        T: Send + Sync + 'static,
+        R: IdleDispatch + RuntimeWait + RuntimeQuery + Send + Sync + 'static,
+    {
+        inner::plugin_prepare_v1::<T, R>(self, terminal, config, runtime)
+    }
+
+    /// 不提供运行时（runtime）的专用初始化 v1 准备方法；没有 D 参数。
+    /// 版本选择、占用、持有与失败条件同 prepare_v1。
+    #[cfg(feature = "init_v1")]
+    // @trace 16
+    pub fn prepare_v1_without_runtime<T: Send + Sync + 'static>(
+        &self,
+        terminal: TerminalInput<T>,
+        config: Config,
+    ) -> Result<Initialization> {
+        inner::plugin_prepare_v1_without_runtime::<T>(self, terminal, config)
+    }
+
     /// 读取宿主自己的副本。初始化、关闭和该管理代退役之后均可读取。
     // @trace 7
     pub fn metadata(&self) -> &Metadata {
         inner::plugin_metadata(self)
     }
 
-    /// 为一轮初始化（initialization）交出配置（Config）、终端（terminal）、
+    /// 按初始化 v2 为一轮交出配置（Config）、终端（terminal）、
     /// 可选运行时（runtime）和初始化数据（initialization data）D，尚未调用插件（plugin）。
     /// D 按值交出，不要求 `Clone`；共享方式由实际类型决定。失败不承诺退回原值。
     /// 已被占用的完整版本不能另开一轮。
+    #[cfg(feature = "init_v2")]
     // @trace 8
     pub fn prepare<T, R, D>(
         &self,
@@ -140,8 +172,9 @@ impl Plugin {
         inner::plugin_prepare::<T, R, D>(self, terminal, config, runtime, data)
     }
 
-    /// 省略运行时（runtime）的初始化（initialization）；终端（terminal）、配置
+    /// 省略运行时（runtime）的初始化 v2；终端（terminal）、配置
     /// （Config）及数据（data）仍必传。无数据内容时传 `()`，失败不承诺退回原值。
+    #[cfg(feature = "init_v2")]
     // @trace 9
     pub fn prepare_without_runtime<T: Send + Sync + 'static, D: Send + Sync + 'static>(
         &self,

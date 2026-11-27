@@ -1,7 +1,11 @@
 use super::*;
 use crate::package::{BuildDependency, BuildFile, DependencyUse, Target};
 use object::{Architecture, BinaryFormat, ExportTarget, NameOrOrdinal, Object, ObjectKind};
-use pi_ffi_abi::management::{CLOSE_V1, INITIALIZE_V2, METADATA_V1};
+use pi_ffi_abi::management::{CLOSE_V1, METADATA_V1, InterfaceVersion, InterfaceVersionStatus, ManagementInterface, INTERFACE_VERSIONS};
+#[cfg(any(feature = "init_v1", test))]
+use pi_ffi_abi::management::INITIALIZE_V1;
+#[cfg(any(feature = "init_v2", test))]
+use pi_ffi_abi::management::INITIALIZE_V2;
 use pi_result::{attachment::PathAttachment, Error, ErrorKind};
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::Path};
@@ -206,18 +210,15 @@ fn check_binary(manifest: &BuildManifest, bytes: &[u8], plugin: bool) -> Result<
 
 fn check_exports(binary: &object::File<'_>) -> Result<()> {
     use object::ObjectSection;
-    let expected = [
-        METADATA_V1.to_bytes(),
-        INITIALIZE_V2.to_bytes(),
-        CLOSE_V1.to_bytes(),
-    ];
-    let mut found = [false; 3];
+    let expected = INTERFACE_VERSIONS.iter().filter(|entry| entry.status == InterfaceVersionStatus::Available && version_enabled(entry)).collect::<Vec<_>>();
+    let mut found = vec![false; expected.len()];
     for export in binary.exports().map_err(binary_error)? {
         let export = export.map_err(binary_error)?;
         let NameOrOrdinal::Name(name) = export.name() else {
             continue;
         };
-        let Some(index) = expected.iter().position(|entry| *entry == name) else {
+        reject_yanked_export(INTERFACE_VERSIONS, name)?;
+        let Some(index) = expected.iter().position(|entry| entry.symbol.to_bytes() == name) else {
             continue;
         };
         let published_function = match export.flags() {
@@ -256,11 +257,11 @@ fn check_exports(binary: &object::File<'_>) -> Result<()> {
         }
         found[index] = true;
     }
-    if let Some(index) = found.iter().position(|found| !*found) {
-        return Err(
-            loader_error(ErrorKind::NotFound, "missing direct management export")
-                .attach(String::from_utf8_lossy(expected[index]).into_owned()),
-        );
+    for interface in [ManagementInterface::Initialization, ManagementInterface::Metadata, ManagementInterface::Close] {
+        if !expected.iter().zip(&found).any(|(entry, found)| entry.interface == interface && *found) {
+            let names = expected.iter().filter(|entry| entry.interface == interface).map(|entry| entry.symbol.to_string_lossy()).collect::<Vec<_>>().join(" / ");
+            return Err(loader_error(ErrorKind::NotFound, "missing direct management export").attach(names));
+        }
     }
     Ok(())
 }
@@ -394,14 +395,23 @@ pub(super) fn verify_image(
     let required = required_linked_dependencies(&files)?;
     let dependencies = verify_mapped_dependencies(&files, |index, _| required[index])?;
     let metadata = verify_entry(module, identity, METADATA_V1)?;
-    let initialize = verify_entry(module, identity, INITIALIZE_V2)?;
     let close = verify_entry(module, identity, CLOSE_V1)?;
-    // SAFETY: 受管制品的三个直接导出（direct exports）有固定 C 签名。
-    // 入口地址均已核对归属于本次持有的同一实际文件。
+    // 只解析实际直接声明的可用版本，避免依赖库同名符号冒充缺席入口（entrypoint）。
+    let bytes = read_verified_binary(&files.main)?;
+    let binary = object::File::parse(bytes.as_slice()).map_err(binary_error)?;
+    check_exports(&binary)?;
+    let exported = binary.exports().map_err(binary_error)?.collect::<std::result::Result<Vec<_>, _>>().map_err(binary_error)?;
+    let present = |name: &std::ffi::CStr| exported.iter().any(|entry| matches!(entry.name(), NameOrOrdinal::Name(actual) if actual == name.to_bytes()));
+    // SAFETY: 每个地址均经同一实际文件归属核验；各版本分别使用自己的准确 C 签名。
     let entries = unsafe {
         Entrypoints {
             metadata: std::mem::transmute::<*const core::ffi::c_void, MetadataFnV1>(metadata),
-            initialize: std::mem::transmute::<*const core::ffi::c_void, InitializeFnV2>(initialize),
+            initialize: InitializationEntrypoints {
+                #[cfg(feature = "init_v1")]
+                v1: if present(INITIALIZE_V1) { Some(std::mem::transmute::<*const core::ffi::c_void, InitializeFnV1>(verify_entry(module, identity, INITIALIZE_V1)?)) } else { None },
+                #[cfg(feature = "init_v2")]
+                v2: if present(INITIALIZE_V2) { Some(std::mem::transmute::<*const core::ffi::c_void, InitializeFnV2>(verify_entry(module, identity, INITIALIZE_V2)?)) } else { None },
+            },
             close: std::mem::transmute::<*const core::ffi::c_void, CloseFnV1>(close),
         }
     };
@@ -434,9 +444,10 @@ pub(super) fn check_inputs(image: &VerifiedImage, has_runtime: bool) -> Result<(
         ));
     }
     // 配置（Config）、终端（terminal）和数据（data）的宿主适配代码来自同一 Rust 动态库（dylib）。
-    // 以宿主实际代码地址核对该制品。分配器（allocator）约定来自此前核准的不可变构建记录。
+    // 以共享适配库（shared adapter library）返回的只读静态对象（static object）地址核对该制品。
+    // 分配器（allocator）约定来自此前核准的不可变构建记录。
     let host_adapter = mapped_address_identity(
-        pi_ffi_adapters::config::ConfigInput::take as *const core::ffi::c_void,
+        pi_ffi_adapters::library_address(),
     )?;
     let shared = files
         .package
@@ -1146,4 +1157,47 @@ fn mapped_metadata_range(identity: MappedIdentity, version: *const u8, end: usiz
         cursor = next;
     }
     true
+}
+
+fn version_enabled(entry: &InterfaceVersion) -> bool {
+    match entry.feature {
+        "init_v1" => cfg!(feature = "init_v1"),
+        "init_v2" => cfg!(feature = "init_v2"),
+        "metadata_v1" => cfg!(feature = "metadata_v1"),
+        "close_v1" => cfg!(feature = "close_v1"),
+        _ => false,
+    }
+}
+
+pub(super) fn select_initialization(entries: &InitializationEntrypoints, version: InitializationVersion) -> Result<InitializationEntry> {
+    let selected: Option<InitializationEntry> = match version {
+        #[cfg(feature = "init_v1")]
+        InitializationVersion::V1 => entries.v1.map(InitializationEntry::V1),
+        #[cfg(feature = "init_v2")]
+        InitializationVersion::V2 => entries.v2.map(InitializationEntry::V2),
+    };
+    selected.ok_or_else(|| loader_error(ErrorKind::Unsupported, "requested initialization entry is unavailable"))
+}
+
+fn reject_yanked_export(catalog: &[InterfaceVersion], name: &[u8]) -> Result<()> {
+    if catalog.iter().any(|entry| entry.status == InterfaceVersionStatus::Yanked && entry.symbol.to_bytes() == name) {
+        return Err(loader_error(ErrorKind::Unsupported, "yanked management export").attach(String::from_utf8_lossy(name).into_owned()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    /// 未来撤回（yank）策略不受编入能力过滤；测试目录不改变生产目录。
+    #[test]
+    fn yanked_export_is_rejected_independently_of_features() {
+        let original = &INTERFACE_VERSIONS[0];
+        let catalog = [InterfaceVersion { interface: original.interface, major: original.major, symbol: original.symbol, feature: original.feature, latest: original.latest, status: InterfaceVersionStatus::Yanked, previous: original.previous, change: original.change }];
+        let error = reject_yanked_export(&catalog, INITIALIZE_V1.to_bytes()).err().unwrap();
+        assert_eq!(*error.current_context(), ErrorKind::Unsupported);
+        assert!(reject_yanked_export(&catalog, INITIALIZE_V2.to_bytes()).is_ok());
+        assert!(INTERFACE_VERSIONS.iter().all(|entry| entry.status == InterfaceVersionStatus::Available));
+    }
 }

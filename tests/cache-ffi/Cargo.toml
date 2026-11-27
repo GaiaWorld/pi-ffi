@@ -1,0 +1,61 @@
+[package]
+name = "cache-ffi"
+version = "1.5.0+build.alpha"
+edition = "2021"
+publish = false
+description = "WSL 中使用原共享缓存客户端的真实双进程 FFI 测试"
+license = "Apache-2.0"
+license-file = "../../LICENSE"
+repository = "https://github.com/GaiaWorld/pi-ffi"
+
+[workspace]
+resolver = "2"
+
+[lib]
+name = "cache_ffi_plugin"
+crate-type = ["cdylib"]
+path = "plugin.rs"
+
+[[bin]]
+name = "cache-ffi-host"
+path = "host.rs"
+
+[[bin]]
+name = "cache-native-probe"
+path = "client.rs"
+
+[dependencies]
+pi_ffi = { path = "../../crates/pi_ffi", features = ["init_v1"] }
+pi_ffi_core = { path = "../../crates/pi_ffi_core" }
+pi_ffi_macros = { path = "../../crates/pi_ffi_macros" }
+pi_result = { path = "../../../pi_result" }
+pi_shared_cache_service = { path = "../../target/cache-ffi/inputs/cache-preflight/pi_shared_cache_service" }
+pi_shared_cache_client = { path = "../../target/cache-ffi/inputs/cache-preflight/pi_shared_cache_client" }
+pi_p2p = { version = "1.3", registry = "yn" }
+pi_p2p_service = { version = "0.3", registry = "yn" }
+pi_service = { version = "0.6", registry = "yn" }
+pi-async-rt = "0.5"
+base64 = "0.22"
+fory = "0.14"
+futures = "0.3"
+sha2 = "0.11"
+libloading = "0.9"
+pi_async_runtime = { package = "pi-async-runtime", version = "0.1", path = "../../../pi-async-rt_v1.0/crates/runtime", optional = true }
+
+[features]
+macro-exports = []
+optional-runtime = ["macro-exports", "dep:pi_async_runtime"]
+
+[patch.crates-io]
+pi-async-rt = { path = "../../target/cache-ffi/inputs/repro/pi-async-rt" }
+
+[patch.yn]
+pi_p2p = { path = "../../target/cache-ffi/inputs/upstream/pi_p2p-1.3.22" }
+ipc_ring = { path = "../../target/cache-ffi/inputs/repro/native-components/ipc_ring-0.3.4" }
+pi_child_process = { path = "../../target/cache-ffi/inputs/repro/native-components/pi_child_process-0.12.0" }
+pi_p2p_service = { path = "../../target/cache-ffi/inputs/upstream/pi-p2p-service" }
+pi_service = { path = "../../target/cache-ffi/inputs/upstream/pi-service" }
+pi_service_macro = { path = "../../target/cache-ffi/inputs/repro/native-components/pi_service_macro-0.3.2" }
+pi_shared_cache_service = { path = "../../target/cache-ffi/inputs/cache-preflight/pi_shared_cache_service" }
+pi_ets = { path = "../../target/cache-ffi/inputs/cache-preflight/pi_ets" }
+pi_uniqueid_service = { path = "../../target/cache-ffi/inputs/cache-preflight/pi_uniqueid_service" }
