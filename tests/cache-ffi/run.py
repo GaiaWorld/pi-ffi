@@ -105,8 +105,8 @@ def command(args, log, timeout, environment=None):
         raise RuntimeError('测试命令失败；原始日志：' + str(log))
 
 
-def artifacts(form, identity, output, no_build, build_inputs):
-    destination = CACHE / 'artifacts' / form
+def artifacts(form, profile, identity, output, no_build, build_inputs):
+    destination = CACHE / 'artifacts' / (form if profile == 'debug' else form + '-release')
     record_path = destination / 'record.json'
     if record_path.exists():
         previous = json.loads(record_path.read_text())
@@ -135,6 +135,8 @@ def artifacts(form, identity, output, no_build, build_inputs):
     environment = dict(os.environ, CARGO_HOME=str(CACHE / 'cargo'), CARGO_BUILD_JOBS='4',
                        CARGO_PROFILE_DEV_DEBUG='0', RUSTFLAGS='-C prefer-dynamic')
     args = ['cargo', 'build', '--offline', '--locked', '--target-dir', str(CACHE / 'build'), '-p', 'cache-ffi']
+    if profile == 'release':
+        args += ['--release']
     if form != 'manual':
         args += ['--features', 'macro-exports' if form == 'macro' else 'optional-runtime']
     command(args, output / ('build-' + form + '.log'), 600, environment)
@@ -144,7 +146,7 @@ def artifacts(form, identity, output, no_build, build_inputs):
             path = destination / name
             if path.is_file():
                 path.unlink()
-    target = CACHE / 'build/debug'
+    target = CACHE / 'build' / profile
     standard_directory = Path(subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True).strip())
     standard, = standard_directory.glob('libstd-*.so')
     sources = [target / 'cache-ffi-host', target / 'cache-native-probe',
@@ -178,12 +180,21 @@ def collect_run_files(run_root, output):
 
 
 def main():
+    # 通过判据依赖断言（assertion），优化解释模式会移除这些检查。
+    if not __debug__:
+        raise RuntimeError('测试需要启用 Python 断言（assertion）')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--form', choices=('all', 'manual', 'macro', 'optional'), default='all')
     parser.add_argument('--sequence', choices=('both', '121', '212'), default='both')
+    parser.add_argument('--runtime', choices=('none', 'some'), default='none')
+    parser.add_argument('--repeat', type=int, choices=range(1, 9), default=1)
+    parser.add_argument('--release', action='store_true', help='使用独立的优化制品（optimized artifacts）')
     parser.add_argument('--no-build', action='store_true', help='只允许复用匹配源码的已核制品')
     parser.add_argument('--skip-data-boundaries', action='store_true', help='只运行指定双进程组合')
     args = parser.parse_args()
+    if args.runtime == 'some' and args.form != 'optional':
+        parser.error('--runtime some 需要 --form optional')
+    profile = 'release' if args.release else 'debug'
     if sys.platform != 'linux' or 'microsoft' not in os.uname().release.lower():
         raise RuntimeError('真实进程测试只允许在 WSL 中执行')
     if not (CACHE / 'cargo/config.toml').is_file():
@@ -212,13 +223,14 @@ def main():
         forms = ('manual', 'macro', 'optional') if args.form == 'all' else (args.form,)
         sequences = ('121', '212') if args.sequence == 'both' else (args.sequence,)
         for form in forms:
-            bundle, built = artifacts(form, identity, output, args.no_build, build_inputs)
+            bundle, built = artifacts(form, profile, identity, output, args.no_build, build_inputs)
             builds.append({'form': form, 'built': built, 'artifacts': str(bundle)})
             plugin_checksums = []
-            for sequence in sequences:
-                attempt = form + '-' + sequence
+            attempts = [(sequence, f'{form}-{sequence}' + (f'-{iteration}' if args.repeat > 1 else ''))
+                        for iteration in range(1, args.repeat + 1) for sequence in sequences]
+            for sequence, attempt in attempts:
                 command([sys.executable, str(HERE / 'run_case.py'), attempt, '--state-root', str(run_root),
-                         '--artifacts-dir', str(bundle), '--sequence', sequence, '--form', form],
+                         '--artifacts-dir', str(bundle), '--sequence', sequence, '--form', form, '--runtime', args.runtime],
                         output / (attempt + '.log'), 100)
                 state = run_root / 'runs' / ('cache-ffi-' + attempt)
                 verdicts.append(json.loads((state / 'verdict.json').read_text()))
@@ -226,14 +238,16 @@ def main():
                 plugin_checksums.append(observed['libcache_ffi_plugin.so']['sha256'])
             assert len(set(plugin_checksums)) == 1
             if form == 'manual' and not args.skip_data_boundaries:
-                command([sys.executable, str(HERE / 'run_data_boundaries.py'), str(run_root), 'manual-' + sequences[0]],
+                first_attempt = attempts[0][1]
+                command([sys.executable, str(HERE / 'run_data_boundaries.py'), str(run_root), first_attempt],
                         output / 'data-boundaries.log', 180)
-                data_boundaries = json.loads((run_root / 'runs' / ('data-boundaries-manual-' + sequences[0] + '-verdict.json')).read_text())
+                data_boundaries = json.loads((run_root / 'runs' / f'data-boundaries-{first_attempt}-verdict.json').read_text())
         assert source_identity()['sha256'] == identity['sha256'], '测试期间源码发生变化'
         if cancellation_requested:
             raise InterruptedError('测试入口收到取消请求')
         collect_run_files(run_root, output)
         result = {'passed': True, 'builds': builds, 'cases': verdicts,
+                  'profile': profile, 'runtime': args.runtime, 'repeat': args.repeat,
                   'native_ipc_calls': sum(item['native_ipc_calls'] for item in verdicts),
                   'standard_metadata_calls': sum(item['standard_metadata_calls'] for item in verdicts),
                   'data_boundaries_requested': 'manual' in forms and not args.skip_data_boundaries,

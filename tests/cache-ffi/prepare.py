@@ -23,6 +23,17 @@ def archive_digest(path):
     return checksum.hexdigest()
 
 
+def fixed_cargo_config(vendor):
+    """为离线构建（offline build）指向同一份已准备的依赖源码。"""
+    return (
+        '[registries.yn]\nindex = "http://ser.yinengyun.com:10082/tech/crates-io.git"\n'
+        '[source.crates-io]\nreplace-with = "fixed-inputs"\n'
+        '[source.yn-fixed]\nregistry = "http://ser.yinengyun.com:10082/tech/crates-io.git"\n'
+        'replace-with = "fixed-inputs"\n[source.fixed-inputs]\ndirectory = '
+        + json.dumps(vendor.as_posix(), ensure_ascii=False) + '\n'
+    )
+
+
 def unpack_fixed(source, checksum, roots, destination):
     if not source.is_file() or archive_digest(source) != checksum:
         raise RuntimeError(f'固定依赖包缺失或摘要不匹配：{source}')
@@ -97,12 +108,7 @@ def main():
             shutil.move(str(staging / 'inputs'), str(CACHE / 'inputs'))
             shutil.move(str(staging / 'vendor.tar.gz'), str(CACHE / 'vendor.tar.gz'))
             cargo.mkdir(exist_ok=True)
-            (cargo / 'config.toml').write_text(
-                '[registries.yn]\nindex = "http://ser.yinengyun.com:10082/tech/crates-io.git"\n'
-                '[source.crates-io]\nreplace-with = "fixed-inputs"\n'
-                '[source.yn-fixed]\nregistry = "http://ser.yinengyun.com:10082/tech/crates-io.git"\n'
-                'replace-with = "fixed-inputs"\n[source.fixed-inputs]\ndirectory = '
-                + json.dumps(str(CACHE / 'vendor')) + '\n')
+            (cargo / 'config.toml').write_text(fixed_cargo_config(CACHE / 'vendor'), encoding='utf-8')
         if not has_p2p_source:
             (staging / p2p_name).rename(p2p_source)
         ready = staging / 'prepared.json'

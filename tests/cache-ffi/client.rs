@@ -182,7 +182,8 @@ fn wait_services(root: &Path, terminal: &Terminal, client: &CacheTerminal<MultiL
     println!("client discovered_services_running=59");
 }
 
-fn client(root: &Path, ffi: bool) {
+/// 连接另一真实进程，经原生发现（discovery）建立进程间通信（IPC）通道。
+fn connect(root: &Path) -> (Arc<Terminal>, CacheTerminal<MultiLayerCodec>, HostId) {
     let ready = read_signal(root, "host-ready");
     let fields: Vec<_> = ready.split_whitespace().collect();
     assert_ne!(fields[0].parse::<u32>().unwrap(), std::process::id());
@@ -197,6 +198,11 @@ fn client(root: &Path, ffi: bool) {
     let client = futures::executor::block_on(CacheTerminalBuilder::new()
         .with_codec(codec).with_p2p_terminal(terminal.clone()).with_event_hub(hub)
         .with_peers(vec![peer]).with_rpc_timeout_ms(2000).with_auto_reconnect(false).with_auto_ipc(true).build()).unwrap();
+    (terminal, client, peer)
+}
+
+fn client(root: &Path, ffi: bool) {
+    let (terminal, client, peer) = connect(root);
     let mut ports = Vec::new();
     if ffi {
         let port: u16 = read_signal(root, "control-port").parse().unwrap();
@@ -228,6 +234,37 @@ fn client(root: &Path, ffi: bool) {
     signal(root, "client-done", "finished");
 }
 
+/// 原生客户端（client）创建临时表、写入并读回已知值，再验证宿主关闭后的控制服务。
+#[cfg(windows)]
+fn windows_basic(root: &Path) {
+    let (terminal, client, peer) = connect(root);
+    wait_services(root, &terminal, &client, peer);
+    futures::executor::block_on(async {
+        let table_name = "pi-ffi-windows-basic".to_owned();
+        let created = client.table_create(&peer, TableCreateRequest {
+            table_name: table_name.clone(), table_type: 0, persistent: false,
+        }).await.unwrap();
+        assert!(matches!(created, TableCreateOutput::Ok(value) if value.success));
+
+        let value = b"pi-ffi-windows-basic".to_vec();
+        let inserted = client.insert(&peer, InsertRequest {
+            table_name: table_name.clone(), key: vec![1], value: value.clone(),
+        }).await.unwrap();
+        assert!(matches!(inserted, InsertOutput::Ok(_)));
+        let read = client.lookup(&peer, LookupRequest { table_name, key: vec![1] }).await.unwrap();
+        assert!(matches!(read, LookupOutput::Ok(found) if found.value == Some(value)));
+    });
+
+    signal(root, "windows-business-done", "finished");
+    read_signal(root, "windows-closed");
+    let port: u16 = read_signal(root, "control-port").parse().unwrap();
+    control(&terminal, peer, port, "windows");
+    let ports = [PORT_TABLE_CREATE, PORT_INSERT, PORT_LOOKUP, port];
+    fs::write(root.join("expected-ports.txt"), ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")).unwrap();
+    println!("client windows_basic_complete=true value_ok=true after_close_control=true");
+    signal(root, "client-done", "finished");
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let root = PathBuf::from(&args[1]);
@@ -235,6 +272,8 @@ fn main() {
         "host" => host(&root, args[2].parse().unwrap()),
         "client" => client(&root, false),
         "ffi-client" => client(&root, true),
+        #[cfg(windows)]
+        "windows-basic" => windows_basic(&root),
         _ => panic!("进程角色（process role）无效"),
     }
 }

@@ -9,7 +9,11 @@ use pi_service::{MultiLayerCodec, Service, ServiceAccessMode, ServiceContexts, S
 use pi_result::ErrorKind;
 use sha2::{Digest, Sha256};
 mod observation;
-use std::{fs, io::Write, os::unix::fs::MetadataExt, path::{Path, PathBuf},
+#[cfg(feature = "optional-runtime")]
+mod runtime_case;
+#[cfg(not(windows))]
+use std::os::unix::fs::MetadataExt;
+use std::{fs, io::Write, path::{Path, PathBuf},
     sync::{Arc, atomic::{AtomicUsize, Ordering}}, thread, time::{Duration, Instant}};
 const UUID: [u8;16] = [0x29,0x57,0,0x98,0xaa,0x48,0x46,0x8c,0xb5,0x12,0x63,0xc2,0x6b,0x24,0xa9,0x31];
 const VERSION: &str = "1.5.0+build.alpha";
@@ -54,12 +58,16 @@ fn build_file(root: &Path, name: &str) -> BuildFile {
 }
 
 fn build_manifest(root: &Path, version: Version, host: &HostBuild) -> BuildManifest {
+    #[cfg(not(windows))]
+    let (target, extension, adapter, plugin) = (Target::LinuxX86_64Gnu, ".so", "libpi_ffi_adapters.so", "libcache_ffi_plugin.so");
+    #[cfg(windows)]
+    let (target, extension, adapter, plugin) = (Target::WindowsX86_64Msvc, ".dll", "pi_ffi_adapters.dll", "cache_ffi_plugin.dll");
     let rust_std = fs::read_dir(root)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .find(|name| name.starts_with("libstd-") && name.ends_with(".so"))
+        .find(|name| name.strip_prefix("lib").unwrap_or(name).starts_with("std-") && name.ends_with(extension))
         .unwrap();
-    let dependencies = ["libpi_ffi_adapters.so", rust_std.as_str()]
+    let dependencies = [adapter, rust_std.as_str()]
         .into_iter()
         .map(|name| BuildDependency {
             file: build_file(root, name),
@@ -68,10 +76,10 @@ fn build_manifest(root: &Path, version: Version, host: &HostBuild) -> BuildManif
         })
         .collect();
     BuildManifest {
-        target: Target::LinuxX86_64Gnu,
+        target,
         uuid: UUID,
         version,
-        library: build_file(root, "libcache_ffi_plugin.so"),
+        library: build_file(root, plugin),
         dependencies,
         rust_build_sha256: host.rust_build_sha256,
         allocator: host.allocator.clone(),
@@ -79,6 +87,7 @@ fn build_manifest(root: &Path, version: Version, host: &HostBuild) -> BuildManif
     }
 }
 
+#[cfg(not(windows))]
 fn mapping_and_file_handles(file: &Path) -> (bool, usize) {
     let artifact = fs::metadata(file).unwrap();
     let is_artifact = |path: &Path| {
@@ -222,7 +231,8 @@ fn configuration(label: &str, fail: bool) -> pi_ffi::config::pi_config::Config {
 }
 
 /// 按原轮明确选版（version selection）；v1 分支从未构造 D。
-fn prepare_version(plugin: &Plugin, terminal: &Arc<Terminal>, label: &str, fail: bool, version: u8, ordinal: usize)
+fn prepare_version(plugin: &Plugin, terminal: &Arc<Terminal>, label: &str, fail: bool, version: u8, ordinal: usize,
+    #[cfg(feature = "optional-runtime")] runtime: Option<Arc<pi_async_runtime::Handle>>)
     -> (Initialization, Option<Arc<AtomicUsize>>) {
     // SAFETY: 同一配套构建（matching build）的真实终端，宿主持续持有。
     let input = unsafe { TerminalInput::new(terminal.clone()) };
@@ -232,7 +242,7 @@ fn prepare_version(plugin: &Plugin, terminal: &Arc<Terminal>, label: &str, fail:
             #[cfg(not(feature = "optional-runtime"))]
             let round = plugin.prepare_v1_without_runtime(input, configuration(label, fail)).unwrap();
             #[cfg(feature = "optional-runtime")]
-            let round = plugin.prepare_v1::<_, pi_async_runtime::Handle>(input, configuration(label, fail), None).unwrap();
+            let round = plugin.prepare_v1::<_, pi_async_runtime::Handle>(input, configuration(label, fail), runtime).unwrap();
             (round, None)
         }
         2 => {
@@ -241,13 +251,14 @@ fn prepare_version(plugin: &Plugin, terminal: &Arc<Terminal>, label: &str, fail:
             #[cfg(not(feature = "optional-runtime"))]
             let round = plugin.prepare_without_runtime(input, configuration(label, fail), data).unwrap();
             #[cfg(feature = "optional-runtime")]
-            let round = plugin.prepare::<_, pi_async_runtime::Handle, _>(input, configuration(label, fail), None, data).unwrap();
+            let round = plugin.prepare::<_, pi_async_runtime::Handle, _>(input, configuration(label, fail), runtime, data).unwrap();
             (round, Some(shared))
         }
         _ => panic!("unsupported initialization sequence"),
     }
 }
 
+#[cfg(not(windows))]
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let root = PathBuf::from(&args[0]); let deployment = PathBuf::from(&args[1]);
@@ -269,6 +280,11 @@ fn main() {
         data_boundary_case(&manager, &package, &request, &terminal, &effects, mode);
         return;
     }
+    #[cfg(feature = "optional-runtime")]
+    let runtimes = (std::env::var("PI_FFI_TEST_RUNTIME").as_deref() == Ok("some")).then(|| {
+        pi_clock_manual::global::try_init().unwrap();
+        std::array::from_fn::<_, 3, _>(|_| runtime_case::HostRuntime::new())
+    });
     let peer = terminal.registry().local_peer_id();
     signal(&root, "control-port", &CONTROL_PORT.to_string());
     signal(&root, "host-ready", &format!("{} {peer} {port}", std::process::id()));
@@ -277,15 +293,25 @@ fn main() {
     let mut metadata_calls = 0;
     let mut old: Option<(Plugin, Initialization)> = None;
     for (index, label) in ["red", "blue"].into_iter().enumerate() {
+        let load_started = Instant::now();
         let plugin = manager.load(&package, &request).unwrap();
+        let load_elapsed = load_started.elapsed();
         assert_eq!(plugin.metadata().uuid, UUID); assert_eq!(plugin.metadata().version, version);
         metadata_calls += metadata_queries(&artifact, &effects, &format!("before-init-{index}"));
-        let (round, shared) = prepare_version(&plugin, &terminal, label, false, sequence[index], index);
+        let (round, shared) = prepare_version(&plugin, &terminal, label, false, sequence[index], index,
+            #[cfg(feature = "optional-runtime")]
+            runtimes.as_ref().map(|entries| entries[index].input()));
+        let init_started = Instant::now();
         round.initialize().unwrap();
+        let init_elapsed = init_started.elapsed();
         let publication = local_cache_publication(&terminal, peer);
         assert_eq!(publication.version, 2 + index as u64);
         println!("host local_cache_publication round={index} running=59 version_3959={}", publication.version);
         round.initialize().unwrap();
+        #[cfg(feature = "optional-runtime")]
+        if let Some(entries) = &runtimes {
+            entries[index].expect_plugin_task(&root, label);
+        }
         if let Some(shared) = &shared {
             assert_eq!(shared.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(shared), 2);
@@ -310,7 +336,14 @@ fn main() {
         }
         assert_local_publication_preserved(&terminal, &publication);
         println!("host local_cache_publication_preserved round={index} version_3959={}", publication.version);
-        finish_round(&round); round.close().unwrap();
+        let close_started = Instant::now();
+        finish_round(&round);
+        let close_elapsed = close_started.elapsed();
+        round.close().unwrap();
+        #[cfg(feature = "optional-runtime")]
+        if let Some(entries) = &runtimes {
+            entries[index].expect_returned_input(label);
+        }
         if let Some(shared) = &shared {
             assert_eq!(shared.load(Ordering::SeqCst), 1);
             assert_eq!(Arc::strong_count(shared), 1);
@@ -318,7 +351,12 @@ fn main() {
         }
         metadata_calls += metadata_queries(&artifact, &effects, &format!("closed-{index}"));
         assert_eq!(Arc::strong_count(&terminal), 1);
-        plugin.unload().unwrap(); plugin.unload().unwrap();
+        let unload_started = Instant::now();
+        plugin.unload().unwrap();
+        let unload_elapsed = unload_started.elapsed();
+        plugin.unload().unwrap();
+        println!("host ffi_timing round={index} version={} load_ns={} init_ns={} close_ns={} unload_ns={}",
+            sequence[index], load_elapsed.as_nanos(), init_elapsed.as_nanos(), close_elapsed.as_nanos(), unload_elapsed.as_nanos());
         let (mapped, handles) = mapping_and_file_handles(&artifact);
         assert!(mapped); assert_eq!(handles, 0);
         println!("host ffi_round={index} success=true input_arc_count=1 retained_mapping=true file_handles=0");
@@ -328,14 +366,27 @@ fn main() {
     }
     let plugin = manager.load(&package, &request).unwrap();
     metadata_calls += metadata_queries(&artifact, &effects, "before-failed-init");
-    let (round, shared) = prepare_version(&plugin, &terminal, "invalid", true, sequence[2], 2);
+    let (round, shared) = prepare_version(&plugin, &terminal, "invalid", true, sequence[2], 2,
+        #[cfg(feature = "optional-runtime")]
+        runtimes.as_ref().map(|entries| entries[2].input()));
     for _ in 0..2 {
         let error = round.initialize().expect_err("插件实际返回失败（actual plugin failure）必须保留");
         assert_eq!(error.current_context(), &ErrorKind::InvalidInput);
         assert!(pi_result::debug_message(&error).contains("explicit fixture initialization failure"));
     }
+    #[cfg(feature = "optional-runtime")]
+    if let Some(entries) = &runtimes {
+        entries[2].expect_plugin_task(&root, "invalid");
+    }
     metadata_calls += metadata_queries(&artifact, &effects, "failed-initialization");
     finish_round(&round); round.close().unwrap();
+    #[cfg(feature = "optional-runtime")]
+    if let Some(entries) = runtimes {
+        entries[2].expect_returned_input("invalid");
+        for runtime in entries {
+            runtime.close();
+        }
+    }
     metadata_calls += metadata_queries(&artifact, &effects, "closed-failed-initialization");
     if let Some(shared) = &shared {
         assert_eq!(shared.load(Ordering::SeqCst), 1);
@@ -350,14 +401,66 @@ fn main() {
     println!("host ffi_assertions_complete=true actual_metadata_calls={metadata_calls} input_return=true failed_init_preserved=true");
 }
 
+/// Windows 原生基本验证，依次核对装入、实际元信息、初始化、业务、关闭和终端归还。
+#[cfg(windows)]
+fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let root = PathBuf::from(&args[0]);
+    let deployment = PathBuf::from(&args[1]);
+    let port: u16 = args[2].parse().unwrap();
+    let effects = root.join("input-effects");
+    // 本进程尚未创建其它线程（thread）。
+    std::env::set_var("PI_FFI_ROUND_OBSERVE_FILE", &effects);
+
+    let host = HostBuild {
+        rust_build_sha256: digest(&deployment.join("build-id")),
+        allocator: "system".into(),
+    };
+    let version = Version::parse(VERSION).unwrap();
+    let manifest = build_manifest(&deployment, version.clone(), &host);
+    let artifact = deployment.join(&manifest.library.path);
+    // SAFETY: 宿主、插件和共享适配库（shared adapter library）来自同一受控构建及部署目录。
+    let package = unsafe { PluginPackage::from_verified_build(deployment, manifest) }.unwrap();
+    let manager = Manager::process(host).unwrap();
+    let request = PluginRequest { uuid: UUID, version: VersionReq::parse("^1.2").unwrap() };
+    let plugin = manager.load(&package, &request).unwrap();
+    assert_eq!(plugin.metadata().uuid, UUID);
+    assert_eq!(plugin.metadata().version, version);
+    let metadata_calls = metadata_queries(&artifact, &effects, "before-init");
+
+    let terminal = terminal(&root, port);
+    let peer = terminal.registry().local_peer_id();
+    let (round, shared) = prepare_version(&plugin, &terminal, "windows", false, 2, 0,
+        #[cfg(feature = "optional-runtime")]
+        None);
+    round.initialize().unwrap();
+    local_cache_publication(&terminal, peer);
+    signal(&root, "control-port", &CONTROL_PORT.to_string());
+    signal(&root, "host-ready", &format!("{} {peer} {port}", std::process::id()));
+    wait_signal(&root, "windows-business-done");
+
+    finish_round(&round);
+    let shared = shared.unwrap();
+    assert_eq!(shared.load(Ordering::SeqCst), 1);
+    assert_eq!(Arc::strong_count(&shared), 1);
+    assert_eq!(Arc::strong_count(&terminal), 1);
+    plugin.unload().unwrap();
+    signal(&root, "windows-closed", "closed");
+    wait_signal(&root, "client-done");
+    println!("host windows_basic_complete=true actual_metadata_calls={metadata_calls} input_return=true");
+}
+
 
 /// 拥有型测试数据（owned test data）的真实析构（Drop）由宿主代码实现，经原虚表执行一次。
+#[cfg(not(windows))]
 struct FailingDrop(Arc<AtomicUsize>);
+#[cfg(not(windows))]
 impl Drop for FailingDrop {
     fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); panic!("initialization data cleanup failure"); }
 }
 
 /// 使用真实 P2P 终端和标准管理入口验证合法描述的拒绝及部分消费，不检查插件业务状态。
+#[cfg(not(windows))]
 fn data_boundary_case(manager: &Manager, package: &PluginPackage, request: &PluginRequest,
     terminal: &Arc<Terminal>, effects: &Path, mode: &str) {
     let plugin = manager.load(package, request).unwrap();

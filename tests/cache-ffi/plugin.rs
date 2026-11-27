@@ -40,10 +40,35 @@ fn event(value: &str) {
     writeln!(output, "{value}").unwrap();
 }
 
+#[cfg(feature = "optional-runtime")]
+/// 通过 `Runtime::with_runtime` 在已传入的实例提交一项任务（task）。实际执行由宿主（host）推进。
+fn submit_runtime_probe(runtime: Option<&pi_ffi::runtime::Runtime<Execution>>, config: &mut pi_ffi::config::Config) -> Result<()> {
+    use pi_async_runtime::{RuntimeQuery, TaskDispatch};
+    use pi_ffi::config::pi_config::Value;
+
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let Some(Value::Str(label)) = config.get("probe") else {
+        return Err(Error::new(ErrorKind::InvalidInput).attach("missing runtime probe label"));
+    };
+    let marker = std::path::PathBuf::from(std::env::var_os("PI_FFI_ROUND_OBSERVE_FILE").unwrap())
+        .with_file_name(format!("runtime-task-{label}"));
+    let _task = runtime.with_runtime(|view| {
+        let id = view.id().get();
+        view.spawn(async move {
+            std::fs::write(marker, format!("{id} {:?}\n", std::thread::current().id())).unwrap();
+        }).map_err(|_| Error::new(ErrorKind::Internal).attach("runtime probe submission failed"))
+    }).map_err(|(error, _)| error)??;
+    Ok(())
+}
+
 fn initialize_v1(inputs: LegacyInputs, state: &mut Option<State>) -> Result<()> {
     *state = Some(State::V1(inputs));
     let Some(State::V1(active)) = state.as_mut() else { unreachable!() };
     println!("plugin initialization_callback_version=1 data_input=false");
+    #[cfg(feature = "optional-runtime")]
+    submit_runtime_probe(active.runtime.as_ref(), &mut active.config)?;
     initialize_common(active.terminal.native(), &mut active.config)
 }
 
@@ -53,6 +78,8 @@ fn initialize_v2(inputs: PluginInputs, state: &mut Option<State>) -> Result<()> 
     assert!(active.data.0.load(Ordering::SeqCst) >= 100);
     assert_eq!(active.data.1.fetch_add(1, Ordering::SeqCst), 0);
     println!("plugin initialization_callback_version=2 non_clone_data=true");
+    #[cfg(feature = "optional-runtime")]
+    submit_runtime_probe(active.runtime.as_ref(), &mut active.config)?;
     initialize_common(active.terminal.native(), &mut active.config)
 }
 
@@ -152,6 +179,7 @@ unsafe extern "C" fn pi_ffi_initialize_v2(runtime: *const ObjectRefV1, terminal:
     let replay = unsafe { pi_ffi_core::diagnostic::decode_management(Some(connection.connection()), repeated.outcome) };
     if first.outcome.kind == 0 { replay.unwrap(); }
     else { assert_eq!(pi_ffi_core::diagnostic::status_code(*replay.unwrap_err().current_context()), first.outcome.kind); }
+    // SAFETY: 原宿主仍持有本轮三项共同输入和插件映射，只变更调用的初始化版本。
     let cross = unsafe { EXPORTS.initialize_v1_without_runtime(runtime, terminal, config, initialize_v1) };
     check_failure(connection.connection(), cross.outcome, ErrorKind::Conflict);
     println!("plugin cross_version_conflict=true primary=2");
@@ -190,11 +218,14 @@ fn check_failure(connection: &pi_ffi_core::control::Connection, outcome: Outcome
 }
 
 #[cfg(not(feature = "macro-exports"))]
+/// 在真实初始化回调内调用同一轮的关闭入口，核对忙时（Busy）及诊断（diagnostic）。
 fn check_close_busy(_runtime: *const ObjectRefV1, _terminal: *const ObjectRefV1, config: *const ObjectRefV1) {
     // SAFETY: 标准回调（standard callback）执行期间，宿主仍保活本轮原始配置输入。
     let input = unsafe { &*config };
     let id = InitIdV1 { module_epoch: input.lease.initialization.module_epoch, round: input.lease.initialization.round };
+    // SAFETY: 原始配置输入在同一调用内有效，此处只构造同来源连接（connection）。
     let connection = unsafe { pi_ffi::config::ConfigInput::from_input(input) }.unwrap();
+    // SAFETY: 插件映射和实际轮次均由当前宿主调用保活。
     let outcome = unsafe { EXPORTS.close(id, close) };
     check_failure(connection.connection(), outcome, ErrorKind::Busy);
     println!("plugin close_in_flight_busy=true");
@@ -226,8 +257,10 @@ unsafe extern "C" fn pi_ffi_initialize_v1(runtime: *const ObjectRefV1, terminal:
     }
     // 此数据仅属于明确拒绝的 v2 请求；原 v1 准备和绑定没有第四输入。
     let probe: InitializationData = (AtomicUsize::new(999), Arc::new(AtomicUsize::new(0)), None);
+    // SAFETY: 当前宿主调用保护同一轮的来源与插件映射，此处登记实际 v2 数据类型。
     let probe = unsafe { pi_ffi::data::PublishedData::publish(connection.connection().clone(), probe) }.unwrap();
     probe.with_input(|data| {
+        // SAFETY: 闭包内数据租约及三项共同输入均有效，并指向同一受保护轮次。
         let cross = unsafe { EXPORTS.initialize_without_runtime(runtime, terminal, config, data, initialize_v2) };
         check_failure(connection.connection(), cross.outcome, ErrorKind::Conflict);
         Ok(())

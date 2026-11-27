@@ -12,6 +12,10 @@ import socket
 import subprocess
 import time
 
+# 独立运行本入口时也必须逐项检查角色退出及原生进程间通信（IPC）。
+if not __debug__:
+    raise RuntimeError('测试需要启用 Python 断言（assertion）')
+
 cancellation_requested = False
 
 
@@ -31,7 +35,10 @@ parser.add_argument('--state-root', required=True, type=Path)
 parser.add_argument('--artifacts-dir', required=True, type=Path)
 parser.add_argument('--sequence', choices=('121','212'), required=True)
 parser.add_argument('--form', choices=('manual','macro','optional'), required=True)
+parser.add_argument('--runtime', choices=('none', 'some'), default='none')
 args = parser.parse_args()
+if args.runtime == 'some' and args.form != 'optional':
+    parser.error('--runtime some 需要 --form optional')
 ROOT = args.state_root.resolve()
 assert re.fullmatch(r'[a-zA-Z0-9_-]+', args.attempt)
 assert 'microsoft' in os.uname().release.lower()
@@ -51,7 +58,8 @@ symbols = subprocess.run(['nm', '-D', '--defined-only', str(deployment / 'libcac
 (state / 'exports.txt').write_text(symbols)
 exports = {line.split()[-1] for line in symbols.splitlines() if line.split() and line.split()[-1].startswith('pi_ffi_')}
 assert exports == {'pi_ffi_metadata_v1', 'pi_ffi_initialize_v1', 'pi_ffi_initialize_v2', 'pi_ffi_close_v1'}, exports
-environment = dict(os.environ, LD_LIBRARY_PATH=str(deployment), TMPDIR=str(state), PI_P2P_SERVICE_TRACE_RPC='1', PI_FFI_INITIALIZATION_SEQUENCE=','.join(args.sequence))
+environment = dict(os.environ, LD_LIBRARY_PATH=str(deployment), TMPDIR=str(state), PI_P2P_SERVICE_TRACE_RPC='1',
+                   PI_FFI_INITIALIZATION_SEQUENCE=','.join(args.sequence), PI_FFI_TEST_RUNTIME=args.runtime)
 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as allocation:
     allocation.bind(('127.0.0.1', 0))
     port = allocation.getsockname()[1]
@@ -119,7 +127,16 @@ if args.form == 'manual':
 
 assert 'client baseline_complete=true' in client
 assert client.count('client discovered_services_running=59') == 2
+runtime_ids = dict(re.findall(r'^host runtime_task label=(\w+) id=(\d+) owner_verified=true$', host, re.MULTILINE))
+returned_ids = dict(re.findall(r'^host runtime_after_close label=(\w+) id=(\d+) input_returned=true owner_task=true$', host, re.MULTILINE))
+assert runtime_ids == returned_ids
+if args.runtime == 'some':
+    assert runtime_ids.keys() == {'red', 'blue', 'invalid'}
+    assert len(set(runtime_ids.values())) == 3
+else:
+    assert not runtime_ids
 verdict = {'passed': True, 'roles': results, 'ffi_plugin_loaded': True, 'initialization_versions': [int(v) for v in args.sequence], 'plugin_form': args.form, 'same_dual_artifact': True, 'non_clone_data': True, 'shared_data_instance': True, 'standard_metadata_calls': 18,
+           'runtime': args.runtime, 'runtime_ids': runtime_ids,
            'successful_initialization_rounds': 2, 'failed_initialization_rounds': 1,
            'native_cache_client_business_calls': 102, 'independent_control_calls_after_close': 3,
            'native_ipc_calls': len(finished), 'fallback_calls': 0,

@@ -41,10 +41,11 @@ futures = "0.3"
 sha2 = "0.11"
 libloading = "0.9"
 pi_async_runtime = { package = "pi-async-runtime", version = "0.1", path = "../../../pi-async-rt_v1.0/crates/runtime", optional = true }
+pi_clock_manual = { package = "pi-clock-manual", version = "0.1", path = "../../../pi-clock/crates/manual", optional = true }
 
 [features]
 macro-exports = []
-optional-runtime = ["macro-exports", "dep:pi_async_runtime"]
+optional-runtime = ["macro-exports", "dep:pi_async_runtime", "dep:pi_clock_manual"]
 
 [patch.crates-io]
 pi-async-rt = { path = "../../target/cache-ffi/inputs/repro/pi-async-rt" }

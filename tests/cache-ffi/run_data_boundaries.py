@@ -8,6 +8,10 @@ import subprocess
 import sys
 import time
 
+# 独立运行本入口时也必须检查每次失败及实际子进程退出。
+if not __debug__:
+    raise RuntimeError('测试需要启用 Python 断言（assertion）')
+
 cancellation_requested = False
 
 
